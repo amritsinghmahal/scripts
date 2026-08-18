@@ -2,7 +2,7 @@
 
 A userscript that adds three things to every car card on [cars24.com](https://www.cars24.com):
 
-1. **What the car actually costs** — the real drive-away price, not the teaser price.
+1. **How much of the price is fees** — not the car, the paperwork.
 2. **How much cheaper it is than buying that model new** — but only when that comparison is honest.
 3. **How hard the car has been driven** — kilometres per year, not just total odometer.
 
@@ -12,39 +12,45 @@ A userscript that adds three things to every car card on [cars24.com](https://ww
 
 ## Why bother?
 
-Cars24 shows you a price like **₹6.94 lakh**, and just underneath it, in small grey letters,
-`+ other charges`.
+Cars24 quotes you **₹7.38 lakh** and, in small grey letters underneath, `Includes RC transfer & more`.
 
-Those other charges are RC transfer, insurance, a warranty and pre-sale servicing. They are not
-optional and they are not small — between **₹33,000 and ₹56,000** on the cars I checked, which is
-5–19% on top of the number you were quoted. To see them you have to click into a popup. On every
-single car. One at a time.
+"& more" is doing a lot of work there. On that car it is ₹50,474 — RC transfer, third-party
+insurance, a 12-month warranty and pre-sale servicing. The car itself is ₹6,87,339. Across the cars
+I sampled the fees run **₹33,000 to ₹75,000**. Nothing on the card tells you which part is which,
+and you cannot negotiate what you cannot see.
 
-This script just puts the real total on the card:
+This script does the split for you:
 
 ```
-before        ₹8.06L   ₹6.94 lakh
-              + other charges
+before        ₹8.56L   ₹7.38 lakh
+              Includes RC transfer & more
 
-after         ₹8.06L   ₹6.94 lakh
-              ₹7.45L all-in · 5 yrs old
+after         ₹8.56L   ₹7.38 lakh
+              incl. ₹50.5k fees · 5 yrs old
 ```
 
-Hover it and you get the full breakdown:
+Hover it for the itemised version:
 
-> Total ₹7,44,713 — incl. RC transfer price ₹10,000, Third party insurance ₹2,474,
-> Extended Warranty – 12 Months ₹27,000, Car Servicing Charges ₹11,000
+> Car ₹6,87,339 + ₹50,474 fees = ₹7,37,813 — incl. RC transfer price ₹10,000,
+> Third party insurance ₹2,474, Extended Warranty – 12 Months ₹27,000, Car Servicing Charges ₹11,000
 
-Same numbers as the popup. You just don't have to go digging for them.
+Same numbers the site's own price popup shows. You just don't have to open it on every car.
 
 ---
 
 ## The three things it shows
 
-### 1. The all-in price
+### 1. The fee split
 
-Appears on **every** card. It comes from the same place the site's own popup gets it, so it is not
-an estimate — it is the price you would actually pay.
+Appears on **every** card, straight from the endpoint the site's own popup uses — so it is not an
+estimate.
+
+Cars24 has advertised prices both ways, so the script works out which one you are looking at rather
+than assuming. It used to quote the car alone and hide the fees behind a `+ other charges` link;
+today the headline already includes them. Either way you get the number that is missing: the fee
+slice when it is baked in, or `₹12.00L all-in` when something is genuinely still owed on top (some
+cars add tax collected at source, for instance). It never just repeats the price you can already
+see.
 
 ### 2. "% off new" — and why it is often missing
 
@@ -79,7 +85,7 @@ number is better than a wrong number.** Expect the percentage on recent cars; ol
 shows its age instead.
 
 When it does appear, it compares like with like: your city's on-road price against the used car's
-all-in price, both including taxes and registration.
+true total, both including taxes and registration.
 
 ### 3. km per year
 
@@ -113,24 +119,33 @@ cached in your browser — prices for a day, new-car data for a week. Scrolling 
 have already seen costs nothing.
 
 **If it can't reach the network, it gets out of the way.** No error toasts, no broken layout: the
-card just looks like it always did, with the site's own `+ other charges` label untouched.
+card just looks like it always did, with the site's own strapline untouched.
 
-**Nothing moves.** The all-in price is written into the slot the `+ other charges` label already
-occupies — a fixed 19px, inside a fixed-height card that clips overflow. Adding a line would push
-the location out of view, so it replaces instead of appends. Card heights never change and the grid
-never shifts.
+**Nothing moves.** The text goes into the slot that strapline already occupies — a fixed 19px, inside
+a fixed-height card that clips overflow. Adding a line would push the hub location out of view, so it
+replaces rather than appends. Card heights never change and the grid never shifts.
 
 **Cards it skips.** Where Cars24 marks a price negotiable (private seller listings), there is no
-fixed all-in figure to show, so it leaves those alone.
+fixed total to break down, so it leaves those alone.
 
 ---
 
 ## When it breaks
 
-Cars24 is a live site and it changes. Two likely failure modes:
+Cars24 is a live site and it changes — it already has once since this was written. The advertised
+price used to be the car alone with the fees hidden behind a `+ other charges` link; now the fees are
+baked into the headline and the strapline reads `Includes RC transfer & more`. The `showOtherCharges`
+flag flipped to `false` and `totalExtraCharges` started reporting `0` at the same time.
 
-- **The all-in price stops appearing.** The charges endpoint or its headers changed. The script
-  fails quietly by design, so the card just reverts to normal.
+That is why the script measures the advertised price against the true total instead of trusting
+either flag. If Cars24 flips back, it follows without a code change.
+
+Likely failure modes:
+
+- **The fee figure stops appearing.** The charges endpoint or its headers changed. The script fails
+  quietly by design, so the card just reverts to normal.
+- **The figure looks wrong or repeats the price.** The script could not read the advertised price off
+  the card. It reads the last price in the block, skipping any struck-through "was" price.
 - **"% off new" disappears everywhere.** The new-car pages changed shape. Two payload formats exist
   today — some pages inline all their data, some use back-references — and the parser handles both,
   but a third would need work.
@@ -152,8 +167,10 @@ cars. Same for "Elite i20". These show `not sold new`, which is the truthful ans
 
 Everything factual here was checked against live pages, not assumed:
 
-- The all-in price was verified on 18 cars. In all 18, the API's base price matched the card's
-  listed price exactly, and base + charges matched the stated total exactly.
+- The fee figures were verified against live listings: base price plus the itemised charges equals
+  the stated total, every time. Note that the API's own `totalExtraCharges` field now reports `0`
+  even when the charge lines are populated, so the script derives the total itself rather than
+  trusting it.
 - The percentage's age ceiling was tuned against real listings so that plausible savings (Creta 17%,
   Swift 22%, Kylaq 24%, Punch 27%, i20 38%) pass, and inflated ones (Slavia 47%, City 49%, City 53%)
   are rejected — with margin on both sides rather than a knife-edge fit.

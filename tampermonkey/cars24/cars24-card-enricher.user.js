@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cars24 Card Enricher
 // @namespace    https://github.com/amrmahal/scripts
-// @version      1.0.0
-// @description  Puts the real drive-away price, an honest "% off new", and km/year on every Cars24 listing card.
+// @version      1.1.0
+// @description  Splits out the fees baked into every Cars24 price, adds an honest "% off new", and shows km/year.
 // @author       amrmahal
 // @match        https://www.cars24.com/*
 // @connect      car-catalog-gateway-in.c24.tech
@@ -15,10 +15,15 @@
 /*
  * Three additions to each car card:
  *
- *   1. The all-in price. The grey "+ other charges" line hides RC transfer, insurance, warranty
- *      and servicing - between Rs 33,000 and Rs 56,000 on the cars I sampled, 5-19% on top of the
- *      headline. The site's own popup fetches those figures from /detail/v1/charges/{id}, which
- *      needs no login, so we ask for them directly and write the total where the teaser was.
+ *   1. What the fees actually are. Every price carries RC transfer, insurance, a warranty and
+ *      pre-sale servicing - Rs 33,000 to Rs 75,000 on the cars I sampled. The site fetches those
+ *      figures from /detail/v1/charges/{id}, which needs no login, so we ask for them directly.
+ *
+ *      Cars24 has advertised prices both ways and may change again, so the script measures instead
+ *      of assuming. It used to quote the car alone and hide the fees behind a "+ other charges"
+ *      link; today the price already includes them and the strapline just says "Includes RC
+ *      transfer & more". Either way we print the figure the shopper cannot see: the fee slice when
+ *      it is baked in, or the true total when there is still something owed on top.
  *
  *   2. How much cheaper this is than the same model new - but only when that holds up. Two traps
  *      make the naive version worthless:
@@ -137,7 +142,7 @@
     const store = {
         // Bump SCHEMA whenever a cached record changes shape. Entries written by an older version
         // are then ignored and swept, instead of resurfacing as undefined/NaN on a card.
-        SCHEMA: 'v2',
+        SCHEMA: 'v3',
         PREFIX: 'c24ce:',
         key(k) { return this.PREFIX + this.SCHEMA + ':' + k; },
 
@@ -209,6 +214,13 @@
             const l = n / 100000;
             if (l >= 100) return '₹' + (l / 100).toFixed(2) + 'Cr';
             return '₹' + l.toFixed(2) + 'L';
+        },
+
+        // Short form for the smaller fee figures: 50474 -> "50.5k", 2474 -> "2,474".
+        compact(n) {
+            if (n >= 100000) return this.lakh(n);
+            if (n >= 10000) return '₹' + (n / 1000).toFixed(1) + 'k';
+            return '₹' + this.grouped(n);
         },
 
         rupees(n) {
@@ -466,14 +478,21 @@
                         store.set(ck, { fail: true }, CONFIG.ttl.chargesFail);
                         return null;
                     }
-                    const out = {
-                        base: this.baseOf(data),
-                        extras: data.totalExtraCharges || 0,
-                        total: data.finalPrice.amount,
-                        lines: (data.charges || [])
-                            .filter((c) => c && c.id !== 'BasePrice')
-                            .map((c) => ({ title: c.title, amount: c.amount, note: c.amountDescription })),
-                    };
+                    const lines = (data.charges || [])
+                        .filter((c) => c && c.id !== 'BasePrice')
+                        .map((c) => ({ title: c.title, amount: c.amount, note: c.amountDescription }));
+
+                    const base = this.baseOf(data);
+                    const total = data.finalPrice.amount;
+
+                    // Derive the fee total ourselves. totalExtraCharges used to hold it but now
+                    // reports 0 even when the individual charge lines are populated, so it cannot
+                    // be relied on. total - base is consistent with the line items either way.
+                    const fees = typeof base === 'number' && total > base
+                        ? total - base
+                        : lines.reduce((sum, l) => sum + (l.amount || 0), 0);
+
+                    const out = { base, fees, total, lines };
                     store.set(ck, out, CONFIG.ttl.charges);
                     return out;
                 })
@@ -826,9 +845,57 @@
         card: 'a.styles_carCardWrapper__sXLIp',
         pricing: '.styles_pricingDetail__Q_3hz',
         label: '.styles_labelContainer__NIr_r',
+        priceWrap: '.styles_priceWrap__VwWBV',
     };
 
     const MARK = 'data-c24ce';
+
+    // The price the card is actually advertising. Exact from the payload where we have it; otherwise
+    // read it off the card, which rounds to the nearest thousand. That is plenty of precision: it
+    // only ever gets compared against a total that differs by tens of thousands.
+    function headlinePrice(card, car) {
+        if (car && typeof car.listingPrice === 'number' && car.listingPrice > 0) return car.listingPrice;
+
+        const wrap = card.querySelector(SEL.priceWrap);
+        if (!wrap) return null;
+
+        // The block may hold a struck-through "was" price as well as the asking price. In every
+        // layout the site has used, the asking price comes last - so prefer the final one rather
+        // than trusting computed styles, which are not always resolvable.
+        const prices = [];
+        for (const el of wrap.querySelectorAll('p, span')) {
+            if (el.children.length) continue;          // leaf nodes only, so we don't double-count
+            const value = parsePrice(el.textContent);
+            if (value) prices.push({ value, struck: struckThrough(el) });
+        }
+        if (!prices.length) return null;
+
+        const asking = prices.filter((p) => !p.struck);
+        const pool = asking.length ? asking : prices;
+        return pool[pool.length - 1].value;
+    }
+
+    function struckThrough(el) {
+        try {
+            const s = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            if (!s) return false;
+            return /line-through/.test(s.textDecorationLine || s.textDecoration || '');
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // "Rs 5.84 lakh" -> 584000, "Rs 6.16L" -> 616000, "Rs 1.2 Cr" -> 12000000
+    function parsePrice(text) {
+        const m = String(text || '').match(/₹\s*([\d.,]+)\s*(lakh|l|cr|crore)?/i);
+        if (!m) return null;
+        const n = parseFloat(m[1].replace(/,/g, ''));
+        if (!isFinite(n) || n <= 0) return null;
+        const unit = (m[2] || '').toLowerCase();
+        if (unit === 'cr' || unit === 'crore') return Math.round(n * 10000000);
+        if (unit === 'lakh' || unit === 'l') return Math.round(n * 100000);
+        return Math.round(n);
+    }
 
     // The label slot is a fixed height:19px inside a 312px overflow:hidden card, so we replace its
     // contents rather than adding a line - adding one would clip the card's own content.
@@ -836,13 +903,14 @@
         let n = card.querySelector(SEL.label);
         if (n) return n;
 
-        // Fallback if the CSS-module hash changes on a deploy: find by the label's own text.
+        // Fallback if the CSS-module hash changes on a deploy: find the strapline under the price by
+        // its wording. The site has used all of these.
         const pricing = card.querySelector(SEL.pricing);
         const scope = pricing || card;
-        const cands = scope.querySelectorAll('div, span, p');
-        for (const c of cands) {
+        for (const c of scope.querySelectorAll('div, span, p')) {
             const t = (c.textContent || '').trim().toLowerCase();
-            if (t === '+ other charges' || t === '+ extra charges') {
+            if (t === '+ other charges' || t === '+ extra charges' ||
+                /^includes rc transfer/.test(t) || t === 'price negotiable') {
                 return c.closest('div') || c;
             }
         }
@@ -861,11 +929,11 @@
 
         // The slot is 19px tall and shares its row with the EMI figure, so there is no room to
         // wrap. If we have overrun the column, shed detail in order of least value: first the
-        // word "all-in", then the suffix. The percentage is the whole point, so it goes last.
+        // wordier form of the price, then the suffix. The percentage is the point, so it goes last.
         if (!overflowing(node)) return;
-        paint(node, fmt.lakh(text.total || 0), text.suffix, tooltip);
+        paint(node, text.short || text.main, text.suffix, tooltip);
         if (!overflowing(node)) return;
-        paint(node, text.main, '', tooltip);
+        paint(node, text.short || text.main, '', tooltip);
     }
 
     function paint(node, main, suffix, tooltip) {
@@ -981,10 +1049,8 @@
         // Flight payload is exact but only covers server-rendered cards; scrape the rest.
         const car = flight.get(appId) || scrape.fromCard(card) || {};
 
-        // Cards where the site itself hides charges, or where price is negotiable (C2C), have no
-        // meaningful fixed all-in figure.
-        const info = car.additionalInfo || {};
-        if (info.showOtherCharges === false || car.businessVertical === 'C2C') return;
+        // Private-seller listings are marked negotiable, so no fixed total exists to quote.
+        if (car.businessVertical === 'C2C') return;
 
         // Yearly running needs nothing from the network, so show it straight away.
         addKmPill(card, car);
@@ -996,18 +1062,37 @@
         if (!charges) return;   // leave the original label untouched
 
         const total = charges.total;
-        const main = fmt.lakh(total) + ' all-in';
+
+        // Cars24 has shipped this both ways, so measure rather than assume. The headline used to be
+        // the car alone with the fees behind a "+ other charges" link; today it already includes
+        // them and the strapline just says "Includes RC transfer & more". Either way the useful
+        // number is the one the shopper cannot see.
+        //
+        // So compare the advertised price against the true total. Anything still owed on top is
+        // what matters; if nothing is, the hidden fact is how much of the price is fees.
+        // The tolerance absorbs the rounding in a scraped "Rs 5.84 lakh".
+        const headline = headlinePrice(card, car);
+        const owedOnTop = headline !== null ? total - headline : 0;
+        const feesAreExtra = headline === null || owedOnTop > 1000;
+
+        const showFees = !feesAreExtra && charges.fees > 0;
+        const main = showFees ? 'incl. ' + fmt.compact(charges.fees) + ' fees' : fmt.lakh(total) + ' all-in';
+        const short = showFees ? fmt.compact(charges.fees) + ' fees' : fmt.lakh(total);
 
         const chargeList = charges.lines.length
             ? charges.lines
                   .map((l) => l.title + ' ' + (l.note && /included/i.test(l.note) ? '(included)' : fmt.rupees(l.amount || 0)))
                   .join(', ')
             : '';
-        let tooltip = 'Total ' + fmt.rupees(total) + (chargeList ? ' — incl. ' + chargeList : '');
+        let tooltip = (showFees
+            ? 'Car ' + fmt.rupees(charges.base) + ' + ' + fmt.rupees(charges.fees) +
+              ' fees = ' + fmt.rupees(total)
+            : 'Total ' + fmt.rupees(total)) +
+            (chargeList ? ' — incl. ' + chargeList : '');
 
         // Show the price straight away; the new-car comparison refines the tail if it earns it.
         let suffix = ageSuffix(car.year);
-        render(card, node, { main, suffix, total }, tooltip);
+        render(card, node, { main, short, suffix }, tooltip);
 
         if (!car.make || !car.model) return;
 
@@ -1041,7 +1126,7 @@
                     res.rejectedPct ? res.rejectedPct + '% > ' + res.ceiling + '% ceiling' : '');
             }
 
-            render(card, node, { main, suffix, total }, tooltip);
+            render(card, node, { main, short, suffix }, tooltip);
         } catch (e) {
             LOG('new-car lookup failed', e);
         }
