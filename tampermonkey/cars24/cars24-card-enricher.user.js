@@ -1,9 +1,8 @@
 // ==UserScript==
 // @name         Cars24 Card Enricher
-// @namespace    https://github.com/amrmahal/scripts
-// @version      1.3.0
+// @namespace    https://github.com/amritsinghmahal/scripts
+// @version      1.3.1
 // @description  Splits out the fees baked into every Cars24 price, adds an honest "% off new", km/year, days listed, and how many people saved the car.
-// @author       amrmahal
 // @match        https://www.cars24.com/*
 // @connect      car-catalog-gateway-in.c24.tech
 // @connect      www.cars24.com
