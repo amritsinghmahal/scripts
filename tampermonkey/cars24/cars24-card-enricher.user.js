@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cars24 Card Enricher
 // @namespace    https://github.com/amrmahal/scripts
-// @version      1.1.0
-// @description  Splits out the fees baked into every Cars24 price, adds an honest "% off new", and shows km/year.
+// @version      1.2.0
+// @description  Splits out the fees baked into every Cars24 price, adds an honest "% off new", km/year, and how long the car has been listed.
 // @author       amrmahal
 // @match        https://www.cars24.com/*
 // @connect      car-catalog-gateway-in.c24.tech
@@ -41,6 +41,12 @@
  *   3. Kilometres per year, in a pill under the wishlist heart. 60,000 km reads very differently
  *      on a 2013 car than a 2021 one.
  *
+ *   4. How long the car has been up for sale, in a second pill below that. Cars24 knows this and
+ *      never shows it: the catalogue API returns firstListingTime, and sorting the site by its own
+ *      "Recently Added" then reading that field back gives a perfectly monotonic sequence, so it is
+ *      the column that sort runs on. A car that has sat for four months is a different conversation
+ *      from one listed yesterday.
+ *
  * Everything is read-only and cached in localStorage. If the network is unavailable the card is
  * left exactly as the site drew it.
  */
@@ -57,6 +63,10 @@
         chargesApi: 'https://car-catalog-gateway-in.c24.tech/detail/v1/charges/',
         chargesHeaders: { X_TENANT_ID: 'INDIA_CAR_LISTING', Source: 'mSite' },
 
+        // Catalogue API. Takes many appointmentIds at once and returns, among much else, the
+        // firstListingTime the site itself sorts "Recently Added" by.
+        listingApi: 'https://car-catalog-gateway-in.c24.tech/listing/v1/cars',
+
         newCarsBase: 'https://www.cars24.com/new-cars/',
         // Authoritative brand/model index: 39 brands, 350 models, one cached request.
         variantSitemap: 'https://www.cars24.com/new-cars/new-cars-variants.xml',
@@ -66,13 +76,26 @@
             chargesFail: 30 * 60 * 1000,       // don't re-hammer dead appointmentIds
             newCarModel: 7 * 24 * 60 * 60 * 1000,
             sitemap: 7 * 24 * 60 * 60 * 1000,
+            // A car's first-listed timestamp never changes, so hold it for a month and recompute
+            // the day count from it each time. Keeps repeat browsing free.
+            firstListing: 30 * 24 * 60 * 60 * 1000,
+            firstListingFail: 60 * 60 * 1000,
         },
 
         maxConcurrent: 4,
         requestGapMs: 120,
 
+        // The response carries the whole card record (~11 KB a car), so ask in decent-sized batches
+        // and only once per car, ever. 200 ids in a URL is accepted; 40 keeps it comfortable.
+        ageBatchSize: 40,
+        ageBatchWaitMs: 90,
+
         // Typical yearly running, used to judge whether a car is low- or high-use for its age.
         avgKmPerYear: 12000,
+
+        // Days on sale before a listing counts as fresh / as having sat a while.
+        freshDays: 14,
+        staleDays: 60,
 
         // Age-aware plausibility ceiling for the computed discount:
         //   ceiling(age) = min(maxPct, firstYearPct + laterYearPct * (age - 1))
@@ -509,6 +532,91 @@
         baseOf(data) {
             const b = (data.charges || []).find((c) => c && c.id === 'BasePrice');
             return b ? b.amount : null;
+        },
+    };
+
+    /* ---------------------------------------------------------------------- *
+     * listingAge - how long each car has been up for sale
+     *
+     * The catalogue API hands back firstListingTime, which the website fetches
+     * but never shows. It is the real thing, not a guess: sorting the site by
+     * its own "Recently Added" and reading this field back gives a perfectly
+     * monotonic sequence, so this is the column that sort runs on.
+     *
+     * It takes many ids per call, so cards are collected for a moment and asked
+     * for together - one request per screenful instead of one per card. The
+     * timestamp never changes once set, so it is cached for a good long while
+     * and the day count recomputed from it on the fly.
+     * ---------------------------------------------------------------------- */
+
+    const listingAge = {
+        queue: new Map(),   // appointmentId -> [resolve, ...]
+        timer: null,
+
+        get(appId) {
+            const cached = store.get('fl:' + appId);
+            if (cached) return Promise.resolve(cached.miss ? null : this.daysSince(cached.t));
+
+            return new Promise((resolve) => {
+                if (!this.queue.has(appId)) this.queue.set(appId, []);
+                this.queue.get(appId).push(resolve);
+
+                // Flush early once we have a full batch, otherwise give the rest of the
+                // screenful a moment to arrive.
+                if (this.queue.size >= CONFIG.ageBatchSize) this.flush();
+                else if (!this.timer) this.timer = setTimeout(() => this.flush(), CONFIG.ageBatchWaitMs);
+            });
+        },
+
+        flush() {
+            clearTimeout(this.timer);
+            this.timer = null;
+            if (!this.queue.size) return;
+
+            const batch = Array.from(this.queue.keys()).slice(0, CONFIG.ageBatchSize);
+            const waiting = new Map();
+            batch.forEach((id) => { waiting.set(id, this.queue.get(id)); this.queue.delete(id); });
+
+            // Deliberately no custom headers: that keeps this a CORS "simple" request, so the
+            // browser skips the preflight round trip. The endpoint does not require any.
+            const url = CONFIG.listingApi + '?appIds=' + batch.join(',');
+
+            gate.run(() => httpGet(url, {}, false))
+                .then((data) => {
+                    const found = new Map();
+                    for (const car of (data && data.content) || []) {
+                        if (car && car.appointmentId && car.firstListingTime) {
+                            found.set(String(car.appointmentId), car.firstListingTime);
+                        }
+                    }
+                    for (const id of batch) {
+                        const t = found.get(id);
+                        if (t) {
+                            store.set('fl:' + id, { t }, CONFIG.ttl.firstListing);
+                        } else {
+                            // Unknown ids are silently dropped from the response rather than
+                            // returned as null, so record the miss and stop asking for a while.
+                            store.set('fl:' + id, { miss: true }, CONFIG.ttl.firstListingFail);
+                        }
+                        this.settle(waiting.get(id), t ? this.daysSince(t) : null);
+                    }
+                })
+                .catch(() => {
+                    for (const id of batch) this.settle(waiting.get(id), null);
+                })
+                .then(() => { if (this.queue.size) this.flush(); });
+        },
+
+        settle(resolvers, value) {
+            (resolvers || []).forEach((r) => r(value));
+        },
+
+        // Timestamps come back both with and without milliseconds in the same response, so parse
+        // with Date.parse rather than anything that assumes a fixed width.
+        daysSince(iso) {
+            const t = Date.parse(iso);
+            if (!isFinite(t)) return null;
+            return Math.max(0, Math.floor((Date.now() - t) / 86400000));
         },
     };
 
@@ -982,33 +1090,51 @@
         return Math.round(km / years);
     }
 
-    function addKmPill(card, car) {
-        if (card.querySelector('[' + KM_PILL + ']')) return;
+    const PILL_STACK = 'data-c24ce-pills';
 
-        const perYear = kmPerYear(car);
-        if (!perYear) return;
+    const TONE = {
+        good: { fg: '#1B6B4A', bg: 'rgba(232,248,240,0.94)' },
+        plain: { fg: '#3F4145', bg: 'rgba(255,255,255,0.94)' },
+        warn: { fg: '#A33A2B', bg: 'rgba(253,236,233,0.94)' },
+    };
 
-        // The heart lives in an absolutely positioned box at top:8px right:8px; its offset parent
-        // is the thumbnail. Hang the pill off that same parent so it tracks the heart.
+    // One absolutely-positioned column under the heart, so pills stack instead of overlapping.
+    // The heart sits in a box at top:8px right:8px whose offset parent is the thumbnail; we hang
+    // the stack off that same parent so it tracks the heart wherever the card is laid out.
+    function pillStack(card) {
+        let stack = card.querySelector('[' + PILL_STACK + ']');
+        if (stack) return stack;
+
         const heartBox = card.querySelector('.styles_outer__ZH1Cg');
         const host = heartBox && heartBox.parentElement && heartBox.parentElement.parentElement;
-        if (!host) return;
+        if (!host) return null;
         if (!host.style.position) host.style.position = 'relative';
 
-        const ratio = perYear / CONFIG.avgKmPerYear;
-        const tone = ratio <= 0.75
-            ? { fg: '#1B6B4A', bg: 'rgba(232,248,240,0.94)' }   // easy life
-            : ratio >= 1.4
-                ? { fg: '#A33A2B', bg: 'rgba(253,236,233,0.94)' } // worked hard
-                : { fg: '#3F4145', bg: 'rgba(255,255,255,0.94)' };
-
-        const pill = document.createElement('div');
-        pill.setAttribute(KM_PILL, '1');
-        pill.style.cssText = [
+        stack = document.createElement('div');
+        stack.setAttribute(PILL_STACK, '1');
+        stack.style.cssText = [
             'position:absolute',
             'top:40px',            // clears the 24px heart at top:8px
             'right:8px',
             'z-index:9',
+            'display:flex',
+            'flex-direction:column',
+            'align-items:flex-end',
+            'gap:4px',
+            'pointer-events:none',
+        ].join(';');
+        host.appendChild(stack);
+        return stack;
+    }
+
+    function addPill(card, marker, value, unit, tone, tooltip) {
+        if (card.querySelector('[' + marker + ']')) return;
+        const stack = pillStack(card);
+        if (!stack) return;
+
+        const pill = document.createElement('div');
+        pill.setAttribute(marker, '1');
+        pill.style.cssText = [
             'padding:2px 6px',
             'border-radius:6px',
             'background:' + tone.bg,
@@ -1018,14 +1144,48 @@
             'font-weight:var(--semibold, 600)',
             'text-align:right',
             'white-space:nowrap',
-            'pointer-events:none',
             'box-shadow:0 1px 3px rgba(0,0,0,0.12)',
         ].join(';');
         pill.innerHTML =
-            '<span>' + fmt.grouped(perYear) + '</span>' +
-            '<span style="font-weight:var(--regular, 400);opacity:0.75"> km/yr</span>';
+            '<span>' + value + '</span>' +
+            '<span style="font-weight:var(--regular, 400);opacity:0.75">' + unit + '</span>';
+        if (tooltip) {
+            pill.setAttribute('title', tooltip);
+            pill.style.pointerEvents = 'auto';
+        }
+        stack.appendChild(pill);
+    }
 
-        host.appendChild(pill);
+    function addKmPill(card, car) {
+        const perYear = kmPerYear(car);
+        if (!perYear) return;
+        const ratio = perYear / CONFIG.avgKmPerYear;
+        const tone = ratio <= 0.75 ? TONE.good : ratio >= 1.4 ? TONE.warn : TONE.plain;
+        addPill(card, KM_PILL, fmt.grouped(perYear), ' km/yr', tone,
+            car.odometer && car.odometer.display
+                ? car.odometer.display + ' over ' + Math.max(1, new Date().getFullYear() - car.year) + ' years'
+                : '');
+    }
+
+    /* ---------------------------------------------------------------------- *
+     * How long the car has been up for sale
+     *
+     * A car that has sat for three months is a different conversation from one
+     * listed yesterday, and the site never tells you which is which.
+     * ---------------------------------------------------------------------- */
+
+    const AGE_PILL = 'data-c24ce-age';
+
+    function addAgePill(card, days) {
+        if (days === null || days < 0) return;
+        const tone = days < CONFIG.freshDays ? TONE.good
+            : days > CONFIG.staleDays ? TONE.warn
+                : TONE.plain;
+        const tip = days === 0
+            ? 'Listed on Cars24 today'
+            : 'First listed on Cars24 ' + days + (days === 1 ? ' day' : ' days') + ' ago' +
+              (days > CONFIG.staleDays ? ' - it has been sitting a while, so there may be room to negotiate' : '');
+        addPill(card, AGE_PILL, days === 0 ? 'listed today' : 'listed ' + days + 'd', '', tone, tip);
     }
 
     /* ---------------------------------------------------------------------- *
@@ -1054,6 +1214,12 @@
 
         // Yearly running needs nothing from the network, so show it straight away.
         addKmPill(card, car);
+
+        // How long it has been on sale. Runs alongside the price work rather than after it, so a
+        // slow catalogue response never holds up the fee figure.
+        listingAge.get(appId)
+            .then((days) => addAgePill(card, days))
+            .catch(() => {});
 
         const node = labelNodeOf(card);
         if (!node) return;

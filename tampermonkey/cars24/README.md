@@ -1,10 +1,11 @@
 # Cars24 Card Enricher
 
-A userscript that adds three things to every car card on [cars24.com](https://www.cars24.com):
+A userscript that adds four things to every car card on [cars24.com](https://www.cars24.com):
 
 1. **How much of the price is fees** — not the car, the paperwork.
 2. **How much cheaper it is than buying that model new** — but only when that comparison is honest.
 3. **How hard the car has been driven** — kilometres per year, not just total odometer.
+4. **How long it has been up for sale** — a car that has sat for months is negotiable.
 
 ![what it looks like](docs/preview.png)
 
@@ -38,7 +39,7 @@ Same numbers the site's own price popup shows. You just don't have to open it on
 
 ---
 
-## The three things it shows
+## The four things it shows
 
 ### 1. The fee split
 
@@ -96,6 +97,24 @@ heart divides by the car's age so you can judge it at a glance:
 - **grey** — normal, around the 12,000 km/yr Indian average
 - **red** — over ~17,000 km/yr, this one has worked
 
+### 4. Days listed
+
+A second pill under the first, showing how long the car has been on sale:
+
+- **green** — under 14 days, fresh stock
+- **grey** — a few weeks, normal
+- **amber** — over 60 days, it has been sitting
+
+This one is worth knowing before you talk money. A car listed 175 days ago has had six months of
+people walking away from it; one listed yesterday has not.
+
+Cars24 tracks this and never shows it. The catalogue API returns a `firstListingTime` per car, and
+you can prove it means what it says: sort the site by its own **Recently Added** and read the field
+back, and the sequence is perfectly monotonic across every card — it is the column that sort runs on.
+So this is an exact date, not an estimate.
+
+The numbers are real ones, not derived: observed ages on a single Pune page ran from 2 days to 175.
+
 ---
 
 ## Installing
@@ -115,8 +134,10 @@ Nothing to configure.
 same endpoint the site's own price popup uses. It never sends your data anywhere.
 
 **It is polite.** Four requests in flight at most, with a small gap between them, and results are
-cached in your browser — prices for a day, new-car data for a week. Scrolling back over cars you
-have already seen costs nothing.
+cached in your browser — prices for a day, new-car data for a week, listing dates for a month.
+Days-listed is asked for in batches, so a screenful of 20 cards costs one request, not twenty. A
+car's first-listed timestamp never changes, so it is fetched once and the day count recomputed
+locally after that. Scrolling back over cars you have already seen costs nothing.
 
 **If it can't reach the network, it gets out of the way.** No error toasts, no broken layout: the
 card just looks like it always did, with the site's own strapline untouched.
@@ -149,6 +170,10 @@ Likely failure modes:
 - **"% off new" disappears everywhere.** The new-car pages changed shape. Two payload formats exist
   today — some pages inline all their data, some use back-references — and the parser handles both,
   but a third would need work.
+- **Days-listed stops appearing.** The catalogue API dropped `firstListingTime`, or the batch
+  endpoint moved. Nothing else depends on it, so the rest of the card carries on. Note the field
+  returns timestamps both with and without milliseconds in the same response, so it is parsed with
+  `Date.parse` rather than anything that assumes a fixed width.
 
 Set `debug: true` at the top of the script and the console will tell you why each card decided what
 it did (`too-good-to-be-true`, `variant-unmatched`, `discontinued`, and so on).
