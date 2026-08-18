@@ -2,7 +2,7 @@
 // @name         Cars24 Card Enricher
 // @namespace    https://github.com/amrmahal/scripts
 // @version      1.0.0
-// @description  Shows the real all-in price (incl. RC transfer, insurance, warranty, servicing) and an honest "% off new" on every Cars24 listing card.
+// @description  Puts the real drive-away price, an honest "% off new", and km/year on every Cars24 listing card.
 // @author       amrmahal
 // @match        https://www.cars24.com/*
 // @connect      car-catalog-gateway-in.c24.tech
@@ -13,25 +13,31 @@
 // ==/UserScript==
 
 /*
- * HOW THIS WORKS
- * --------------
- * [2] All-in price. The site's dashed "+ other charges" teaser hides ~5-19% of the real cost.
- *     The popup behind it calls /detail/v1/charges/{appointmentId}, which needs no auth. We call
- *     it directly and render finalPrice.amount in place of the teaser. Verified on 18 cars:
- *     BasePrice === card listingPrice and BasePrice + totalExtraCharges === finalPrice.amount, 18/18.
+ * Three additions to each car card:
  *
- * [1] "% off new". Only shown when it is defensible. Cars24's own new-car catalog gives real,
- *     itemised, city-specific onRoadPrice figures - but it is booby-trapped:
+ *   1. The all-in price. The grey "+ other charges" line hides RC transfer, insurance, warranty
+ *      and servicing - between Rs 33,000 and Rs 56,000 on the cars I sampled, 5-19% on top of the
+ *      headline. The site's own popup fetches those figures from /detail/v1/charges/{id}, which
+ *      needs no login, so we ask for them directly and write the total where the teaser was.
  *
- *       - /new-cars/volkswagen/polo/ returns HTTP 200 for a car VW stopped selling in India in
- *         2022, with fabricated "Base Variant" Rs 8,00,002 / "Top Variant" Rs 14,00,000 and
- *         isDiscontinued:false, isActive:true. So those flags CANNOT be trusted as a guard.
- *       - ~67% of listings are older generations. A 2015 Honda City computes as "72.7% off",
- *         but most of that is a decade of model-line price inflation, not depreciation.
+ *   2. How much cheaper this is than the same model new - but only when that holds up. Two traps
+ *      make the naive version worthless:
  *
- *     So the comparison runs a validity ladder and FAILS CLOSED: any unmet rung means no
- *     percentage at all, and the card falls back to showing the car's age instead of a number
- *     that cannot be justified. Measured honest coverage is ~8-13% of cards.
+ *        - Car prices climb every year. A 2022 Honda City works out at "53% off" a new one; a
+ *          2015 at "73% off". Most of that gap is the new car getting dearer, not this one losing
+ *          value. An age-based ceiling throws those out.
+ *        - Some catalogue pages are fiction. /new-cars/volkswagen/polo/ still answers 200 for a
+ *          car pulled from India in 2022, offering "Base Variant" at Rs 8,00,002 with
+ *          isDiscontinued:false. The flags cannot be trusted; the placeholder trim names can.
+ *
+ *      When a comparison cannot be made honestly the card shows the car's age, or says the model
+ *      is no longer sold. No number beats a wrong number.
+ *
+ *   3. Kilometres per year, in a pill under the wishlist heart. 60,000 km reads very differently
+ *      on a 2013 car than a 2021 one.
+ *
+ * Everything is read-only and cached in localStorage. If the network is unavailable the card is
+ * left exactly as the site drew it.
  */
 
 (function () {
@@ -60,78 +66,25 @@
         maxConcurrent: 4,
         requestGapMs: 120,
 
-        // Reject a computed discount outside this band. A very high number reliably means a bad
-        // match (wrong generation, phantom page) rather than a real bargain - the 2015 Honda City
-        // case computes as 72.7%.
-        minPct: 1,
-        maxPct: 40,
+        // Typical yearly running, used to judge whether a car is low- or high-use for its age.
+        avgKmPerYear: 12000,
 
-        // Age-aware plausibility ceiling. The generation gate alone is NOT enough: a 2022 Honda
-        // City passes it (5th gen started 2020) yet computes as 53% off, because Honda repriced
-        // the model line upward - that "discount" is price inflation, not depreciation.
-        //
-        // Modelled on the real curve: a steep first-year drop, then a gentler slope, then a cap.
+        // Age-aware plausibility ceiling for the computed discount:
         //   ceiling(age) = min(maxPct, firstYearPct + laterYearPct * (age - 1))
         //   1yr 30%   2yr 33%   3yr 36%   4yr 39%   5yr+ 40%
         //
-        // Chosen for MARGIN, not fitted tightly to the sample: every legitimate case observed sits
-        // >=6pp below its ceiling and every inflated one >=6pp above.
-        //   admits  Creta 2024 17%, Swift 2024 22%, Kylaq 2025 24%, Punch 2023 27%, Kushaq 2021 28%
-        //   rejects Slavia 2022 47%, City 2021 49%, City 2022 53%, City 2015 73%
+        // This is the guard that keeps the number believable. We compare a used car against what
+        // its model costs new TODAY, and model lines get repriced upward year after year - so a
+        // plain subtraction can claim 53% off a 4-year-old Honda City, or 73% off a 2015 one. Most
+        // of that gap is price inflation, not depreciation. Anything over the ceiling is treated as
+        // a bad comparison and no percentage is shown.
+        //
+        // Verified against live listings: admits Creta 2024 17%, Swift 2024 22%, Kylaq 2025 24%,
+        // Punch 2023 27%, i20 2021 38%; rejects Slavia 2022 47%, City 2021 49%, City 2022 53%.
+        minPct: 1,
+        maxPct: 40,
         firstYearPct: 30,
         laterYearPct: 3,
-
-        // Current-generation start years. A listing older than its model's cutoff is a generation
-        // mismatch and gets no percentage.
-        //
-        // NOTE: these are domain knowledge, NOT Cars24 data - the catalog exposes no generation
-        // field. Any model absent from this table is treated as unknown and yields no percentage
-        // (fail closed). Extend this table to widen honest coverage.
-        generationStart: {
-            'maruti-suzuki/swift': 2024,
-            'maruti-suzuki/baleno': 2022,
-            'maruti-suzuki/brezza': 2022,
-            'maruti-suzuki/wagon-r': 2019,
-            'maruti-suzuki/ertiga': 2018,
-            'maruti-suzuki/celerio': 2021,
-            'maruti-suzuki/ciaz': 2018,
-            'maruti-suzuki/grand-vitara': 2022,
-            'maruti-suzuki/fronx': 2023,
-            'hyundai/creta': 2024,
-            'hyundai/venue': 2025,
-            'hyundai/grand-i10-nios': 2019,
-            'hyundai/verna': 2023,
-            'hyundai/exter': 2023,
-            'honda/city': 2020,
-            'honda/amaze': 2024,
-            'honda/elevate': 2023,
-            'tata/nexon': 2023,
-            'tata/tiago': 2023,
-            'tata/punch': 2021,
-            'tata/altroz': 2023,
-            'tata/harrier': 2023,
-            'mahindra/thar': 2025,
-            'mahindra/xuv-3xo': 2024,
-            'mahindra/xuv-7xo': 2021,
-            'mahindra/scorpio-n': 2022,
-            'mahindra/bolero': 2020,
-            'hyundai/i20': 2020,
-            'kia/seltos': 2023,
-            'kia/sonet': 2024,
-            'kia/carens': 2022,
-            'skoda/kushaq': 2024,
-            'skoda/kylaq': 2024,
-            'skoda/slavia': 2022,
-            'renault/kwid': 2022,
-            'renault/triber': 2019,
-            'toyota/glanza': 2022,
-            'toyota/urban-cruiser-hyryder': 2022,
-            'nissan/magnite': 2024,
-            'volkswagen/virtus': 2022,
-            'volkswagen/taigun': 2021,
-            'mg/astor': 2021,
-            'mg/hector': 2023,
-        },
 
         // Used-listing make -> catalog brand slug.
         brandAlias: {
@@ -144,9 +97,9 @@
             vw: 'volkswagen',
         },
 
-        // Used-listing model -> catalog model slug. Every target here was verified to exist in the
-        // sitemap; entries whose target does not exist are deliberately omitted so the lookup 404s
-        // (which correctly reads as "not sold new") instead of matching the wrong car.
+        // Used listings and the new-car catalogue spell some models differently. Each target below
+        // was checked to exist in the catalogue - add to this table when a car you know is on sale
+        // reports "not sold new".
         modelAlias: {
             'wagon r 1.0': 'wagon-r',
             'wagon r': 'wagon-r',
@@ -157,20 +110,19 @@
             'grand i10 nios': 'grand-i10-nios',
             'scorpio n': 'scorpio-n',
             'urban cruiser hyryder': 'urban-cruiser-hyryder',
-            xuv700: 'xuv-7xo',          // same car, renamed XUV 7XO in 2025
+            xuv700: 'xuv-7xo',          // same car, renamed XUV 7XO
             xuv400: 'xuv400-ev',
-            'new i20': 'i20',           // "NEW I20" is the 2020+ generation
+            'new i20': 'i20',           // "NEW I20" is the current i20
 
-            // DELIBERATELY NOT ALIASED - the used nameplate identifies an OLDER generation, so
-            // mapping it to the current slug would compare two different cars:
-            //   "XUV300"    -> xuv-3xo         (renamed 2024; an XUV300 listing is pre-facelift)
-            //   "Elite i20" -> i20             (Elite is the 2014-2020 gen)
-            //   "Octavia"   -> octavia-facelift
-            // These fall through to a 404 / generation-unknown, which correctly yields no
-            // percentage rather than a confident mismatch.
+            // Left out on purpose. These nameplates belong to the previous car, so pointing them at
+            // today's slug would price a listing against a model it is not:
+            //   "XUV300"    (Mahindra renamed it XUV 3XO in 2024)
+            //   "Elite i20" (the 2014-2020 i20)
+            //   "Octavia"   (the catalogue only carries the facelift)
+            // They fall through and report "not sold new", which is the truthful answer.
         },
 
-        // Variants literally named this are placeholder fabrications, never real trims.
+        // Placeholder catalogue pages offer these instead of real trims.
         phantomVariantNames: ['base variant', 'top variant'],
 
         debug: false,
@@ -183,10 +135,29 @@
      * ---------------------------------------------------------------------- */
 
     const store = {
-        // Bump SCHEMA whenever a cached record's shape changes, so old entries are ignored rather
-        // than resurfacing as undefined/NaN in the UI.
-        SCHEMA: 'v1',
-        key(k) { return 'c24ce:' + this.SCHEMA + ':' + k; },
+        // Bump SCHEMA whenever a cached record changes shape. Entries written by an older version
+        // are then ignored and swept, instead of resurfacing as undefined/NaN on a card.
+        SCHEMA: 'v2',
+        PREFIX: 'c24ce:',
+        key(k) { return this.PREFIX + this.SCHEMA + ':' + k; },
+
+        // Drop anything this build cannot read. Cheap: runs once, over our own keys only.
+        sweep() {
+            const mine = this.PREFIX + this.SCHEMA + ':';
+            try {
+                Object.keys(localStorage)
+                    .filter((k) => k.indexOf(this.PREFIX) === 0 && k.indexOf(mine) !== 0)
+                    .forEach((k) => localStorage.removeItem(k));
+            } catch (_) { /* private mode / storage disabled */ }
+        },
+
+        evictAll() {
+            try {
+                Object.keys(localStorage)
+                    .filter((k) => k.indexOf(this.PREFIX) === 0)
+                    .forEach((k) => localStorage.removeItem(k));
+            } catch (_) {}
+        },
 
         get(k) {
             try {
@@ -210,13 +181,11 @@
             try {
                 localStorage.setItem(this.key(k), JSON.stringify({ v, ts: Date.now(), ttl }));
             } catch (e) {
-                // Quota exceeded: evict our own namespace and retry once.
+                // Out of quota: clear our own keys and try once more.
+                this.evictAll();
                 try {
-                    Object.keys(localStorage)
-                        .filter((x) => x.startsWith('c24ce:'))
-                        .forEach((x) => localStorage.removeItem(x));
                     localStorage.setItem(this.key(k), JSON.stringify({ v, ts: Date.now(), ttl }));
-                } catch (_) { /* give up silently; cache is an optimisation, not a requirement */ }
+                } catch (_) { /* the cache is an optimisation, not a requirement */ }
             }
         },
     };
@@ -277,15 +246,31 @@
         },
     };
 
+    // A 404 is meaningful - it tells us the model is off the market - whereas a dropped connection
+    // tells us nothing. Tag the error so callers can tell the two apart instead of guessing.
+    function notFound(err) {
+        return !!err && err.status === 404;
+    }
+
+    function httpError(status) {
+        const e = new Error('HTTP ' + status);
+        e.status = status;
+        return e;
+    }
+
     // CORS on the charges endpoint is access-control-allow-origin: https://www.cars24.com, so a
     // plain fetch works from the page. GM_xmlhttpRequest is the fallback if that ever changes.
     function httpGet(url, headers, asText) {
         return fetch(url, { headers: headers || {}, credentials: 'omit' })
             .then((r) => {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
+                if (!r.ok) throw httpError(r.status);
                 return asText ? r.text() : r.json();
             })
-            .catch(() => gmGet(url, headers, asText));
+            .catch((err) => {
+                // Don't retry a definitive answer through the other transport.
+                if (notFound(err)) throw err;
+                return gmGet(url, headers, asText);
+            });
     }
 
     function gmGet(url, headers, asText) {
@@ -296,7 +281,7 @@
                 url,
                 headers: headers || {},
                 onload: (r) => {
-                    if (r.status < 200 || r.status >= 300) return reject(new Error('HTTP ' + r.status));
+                    if (r.status < 200 || r.status >= 300) return reject(httpError(r.status));
                     try { resolve(asText ? r.responseText : JSON.parse(r.responseText)); }
                     catch (e) { reject(e); }
                 },
@@ -421,10 +406,24 @@
                 model,
                 fuelType: fuel,
                 transmissionType: { value: trans },
+                odometer: this.odometerOf(card),
                 // The alt price is rounded to 2dp; the charges API supplies the exact base, so we
                 // deliberately do NOT use it as a price source.
                 variant: this.variantOf(card),
             };
+        },
+
+        // The spec chips read "25,527 km", "Petrol", "Manual", "MH-13".
+        odometerOf(card) {
+            const chips = card.querySelectorAll('p, span');
+            for (const el of chips) {
+                const m = (el.textContent || '').trim().match(/^([\d,]+)\s*km$/i);
+                if (m) {
+                    const value = parseInt(m[1].replace(/,/g, ''), 10);
+                    if (isFinite(value) && value > 0) return { value: value };
+                }
+            }
+            return null;
         },
 
         // The trim sits in a second span next to the car title, e.g. "AMBITION 1.0L TSI MT".
@@ -445,7 +444,7 @@
     };
 
     /* ---------------------------------------------------------------------- *
-     * chargesApi - feature [2]
+     * chargesApi - the real drive-away price
      * ---------------------------------------------------------------------- */
 
     const chargesApi = {
@@ -495,10 +494,25 @@
     };
 
     /* ---------------------------------------------------------------------- *
-     * newCarCatalog - feature [1], with the validity ladder
+     * newCarCatalog - what the same model costs new today
      * ---------------------------------------------------------------------- */
 
     const slugify = (s) => String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+    // Variant names occasionally carry escapes ("1.5 Turbo – DCT").
+    function unescapeJson(s) {
+        try { return JSON.parse('"' + s + '"'); }
+        catch (_) { return s; }
+    }
+
+    // "navi-mumbai" -> "Navi Mumbai"
+    function titleCase(slug) {
+        return String(slug || '')
+            .split('-')
+            .filter(Boolean)
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(' ');
+    }
 
     // Tails that look like a city in the URL but are not one.
     const NON_CITY_SLUGS = new Set(['cars', 'used-cars', 'sunroof', 'first-owner', 'automatic', 'petrol', 'diesel', 'cng', 'electric']);
@@ -572,12 +586,19 @@
                     this.models.set(key, rec);
                     return rec;
                 })
-                .catch(() => {
-                    // 404 is the reliable "not sold new" signal (verified 10/10).
-                    const rec = { absent: true };
-                    store.set('nc:' + key, rec, CONFIG.ttl.newCarModel);
-                    this.models.set(key, rec);
-                    return rec;
+                .catch((err) => {
+                    // A 404 genuinely means the model has left the catalogue, and that is worth
+                    // remembering for a week. Anything else (offline, timeout, rate limit) says
+                    // nothing about the car, so report it as unknown and do not cache it - the
+                    // alternative is telling someone a Baleno is discontinued because their wifi
+                    // dropped.
+                    if (notFound(err)) {
+                        const rec = { absent: true };
+                        store.set('nc:' + key, rec, CONFIG.ttl.newCarModel);
+                        this.models.set(key, rec);
+                        return rec;
+                    }
+                    return { unknown: true };
                 })
                 .then((v) => { this.inflight.delete(key); return v; });
 
@@ -590,6 +611,11 @@
         // The payload lives inside self.__next_f.push([1,"...."]) string literals, so in the raw
         // HTML every quote is backslash-escaped: \"exShowroomPrice\":1069000. Searching the raw
         // markup for unescaped JSON finds nothing, so decode the flight strings first.
+        // Two payload shapes exist in the wild and both must work:
+        //   compact  - nested arrays are "$ad" back-references, so a variant object is ~300 bytes
+        //   expanded - tags/delta arrays are inlined, pushing a variant past 13KB (Hyundai i20)
+        // So we do not JSON.parse the whole object. We read the fields we need out of a window of
+        // text around each exShowroomPrice hit, which is shape-independent and cheap.
         parseVariants(html) {
             const decoded = this.decodeFlight(html);
             const out = [];
@@ -598,17 +624,29 @@
             while ((m = re.exec(decoded))) {
                 const start = decoded.lastIndexOf('{', m.index);
                 if (start === -1) continue;
-                const slice = flight.balanced(decoded, start);
-                if (!slice || slice.length > 6000) continue;
-                let v;
-                try { v = JSON.parse(slice); } catch (_) { continue; }
-                if (!v || typeof v.exShowroomPrice !== 'number' || !v.name) continue;
+
+                // "name" and "slug" sit immediately before the price; everything else can be far
+                // past a large inlined array, so scan generously forward.
+                const head = decoded.slice(start, m.index);
+                const tail = decoded.slice(m.index, m.index + 60000);
+
+                const name = (head.match(/"name":"((?:\\.|[^"\\])*)"/) || [])[1];
+                if (!name) continue;
+
+                const ex = parseInt(m[1], 10);
+                if (!isFinite(ex) || ex <= 0) continue;
+
+                // Stop at the next variant so we never borrow a neighbour's on-road price.
+                const nextIdx = tail.slice(1).search(/"exShowroomPrice":\s*\d/);
+                const scope = nextIdx > 0 ? tail.slice(0, nextIdx + 1) : tail;
+
+                const onRoad = parseFloat((scope.match(/"onRoadPrice":\s*([\d.]+)/) || [])[1]);
                 out.push({
-                    name: String(v.name),
-                    ex: v.exShowroomPrice,
-                    onRoad: typeof v.onRoadPrice === 'number' ? v.onRoadPrice : null,
-                    fuel: v.fuelType || '',
-                    trans: v.transmissionType || '',
+                    name: unescapeJson(name),
+                    ex,
+                    onRoad: isFinite(onRoad) && onRoad > 0 ? onRoad : null,
+                    fuel: (scope.match(/"fuelType":"([^"]{1,20})"/) || [])[1] || '',
+                    trans: (scope.match(/"transmissionType":"([^"]{1,20})"/) || [])[1] || '',
                 });
             }
             // De-dupe: the payload repeats variants across sections. Keep the entry that carries an
@@ -636,59 +674,63 @@
             return out || html;
         },
 
-        /* -- the validity ladder: returns {pct} or {reason} -- */
+        /* -- Work out what to say about this car versus buying new.
+         *
+         * Returns one of:
+         *   { pct, newPrice, variantName, ... }  a discount we are willing to stand behind
+         *   { discontinued: true }               nobody sells this model new any more
+         *   { reason, range? }                   we know the model but cannot price it honestly
+         */
         async priceFor(car, usedAllIn) {
             const slug = this.resolveSlug(car);
 
-            // Rung 1: model must exist in the catalog index.
+            // Not in the catalogue at all -> the model is off the market.
             const index = await this.loadIndex();
-            if (index.size && !index.has(slug)) return { reason: 'not-sold-new' };
+            if (index.size && !index.has(slug)) return { discontinued: true };
 
-            // Rung 2: generation. Unknown model => fail closed, no percentage.
-            const genStart = CONFIG.generationStart[slug];
-            if (!genStart) return { reason: 'generation-unknown' };
-            if (!car.year || car.year < genStart) return { reason: 'older-generation' };
-
-            // Rung 3: load the model, city-matched where possible.
+            // Prefer the listing's city so we compare on-road against on-road for the same RTO.
+            // City pages come and go, so fall back to the plain model page before giving up.
             const citySlug = this.citySlugFor(car);
             let rec = await this.loadModel(slug, citySlug);
             let cityMatched = !!citySlug;
-            if (rec.absent && citySlug) {
+            if (!rec.variants && citySlug) {
                 rec = await this.loadModel(slug, null);
                 cityMatched = false;
             }
-            if (rec.absent || !rec.variants || !rec.variants.length) return { reason: 'not-sold-new' };
+            if (rec.unknown) return { reason: 'lookup-failed' };
+            if (rec.absent || !rec.variants || !rec.variants.length) return { discontinued: true };
 
-            // Rung 4: phantom guard. Pages like /new-cars/volkswagen/polo/ return 200 with
-            // fabricated Base/Top Variant prices and isDiscontinued:false - so reject on the
-            // variant NAMES, never on those flags.
+            // Some catalogue pages are placeholders: /new-cars/volkswagen/polo/ answers 200 for a
+            // car VW pulled from India in 2022, offering a made-up "Base Variant" at Rs 8,00,002
+            // with isDiscontinued:false. The flags lie, the variant names do not - so filter on
+            // the names and treat a page with nothing left as a model that is no longer sold.
             const real = rec.variants.filter(
                 (v) => !CONFIG.phantomVariantNames.includes(v.name.toLowerCase().trim())
             );
-            if (!real.length) return { reason: 'phantom-catalog-entry' };
+            if (!real.length) return { discontinued: true };
 
-            // Rung 5: variant match, constrained by fuel + transmission.
+            // Match the trim, keeping fuel and gearbox honest.
             const match = this.matchVariant(car, real);
             if (!match) return { reason: 'variant-unmatched', range: this.rangeOf(real) };
 
-            // Defensive: never let a malformed record reach the UI as NaN/undefined.
             const newPrice = typeof match.onRoad === 'number' && isFinite(match.onRoad) && match.onRoad > 0
                 ? match.onRoad
                 : null;
             if (!newPrice || !match.name) return { reason: 'no-onroad-price', range: this.rangeOf(real) };
 
-            // Rung 6: sanity clamps. Out-of-band means a bad match, not a bargain.
             const pct = Math.round((1 - usedAllIn / newPrice) * 100);
-            if (pct < CONFIG.minPct || pct > CONFIG.maxPct) return { reason: 'implausible' };
+            if (pct < CONFIG.minPct) return { reason: 'no-saving' };
 
-            // Age-aware ceiling: catches same-generation cars whose model line was repriced
-            // upward (a 2022 Honda City otherwise computes as 53% off).
+            // Anything above the age ceiling says more about years of price rises than about this
+            // particular car, so we keep quiet rather than quote it.
             const age = Math.max(1, new Date().getFullYear() - car.year);
             const ceiling = Math.min(
                 CONFIG.maxPct,
                 CONFIG.firstYearPct + CONFIG.laterYearPct * (age - 1)
             );
-            if (pct > ceiling) return { reason: 'implausible-for-age', pct, ceiling };
+            // Report the rejected figure under a different name, so no caller can mistake a
+            // refusal for a result by reading .pct.
+            if (pct > ceiling) return { reason: 'too-good-to-be-true', rejectedPct: pct, ceiling };
 
             return { pct, newPrice, variantName: match.name, cityMatched, citySlug };
         },
@@ -814,26 +856,36 @@
             node.setAttribute('data-c24ce-orig', node.innerHTML);
         }
 
-        // Reuse the site's own tokens so this is typographically identical to what it replaced.
-        node.innerHTML =
-            '<span style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap;' +
-            'font-size:var(--font-size-150);line-height:var(--line-height-150);' +
-            'font-weight:var(--medium);color:var(--grey-900)">' +
-            '<span>' + text.main + '</span>' +
-            (text.suffix
-                ? '<span style="font-weight:var(--regular);color:var(--grey-500)">&middot;&nbsp;' + text.suffix + '</span>'
-                : '') +
-            '</span>';
-
-        node.setAttribute('title', tooltip || '');
+        paint(node, text.main, text.suffix, tooltip);
         card.setAttribute(MARK, '1');
 
-        // The slot shares its row with the EMI text, so if the suffix pushes past the column,
-        // drop it rather than wrap and clip.
+        // The slot is 19px tall and shares its row with the EMI figure, so there is no room to
+        // wrap. If we have overrun the column, shed detail in order of least value: first the
+        // word "all-in", then the suffix. The percentage is the whole point, so it goes last.
+        if (!overflowing(node)) return;
+        paint(node, fmt.lakh(text.total || 0), text.suffix, tooltip);
+        if (!overflowing(node)) return;
+        paint(node, text.main, '', tooltip);
+    }
+
+    function paint(node, main, suffix, tooltip) {
+        // Reuse the site's own type tokens so this reads as part of the card, not an addition.
+        node.innerHTML =
+            '<span style="display:inline-flex;align-items:baseline;gap:4px;white-space:nowrap;' +
+            'font-size:var(--font-size-150);line-height:var(--line-height-150);' +
+            'font-weight:var(--medium);color:var(--grey-900)">' +
+            '<span>' + main + '</span>' +
+            (suffix
+                ? '<span style="font-weight:var(--regular);color:var(--grey-500)">&middot;&nbsp;' + suffix + '</span>'
+                : '') +
+            '</span>';
+        node.setAttribute('title', tooltip || '');
+    }
+
+    function overflowing(node) {
         const inner = node.firstElementChild;
-        if (inner && node.clientWidth && inner.scrollWidth > node.clientWidth && text.suffix) {
-            inner.removeChild(inner.lastElementChild);
-        }
+        if (!inner || !node.clientWidth) return false;
+        return inner.scrollWidth > node.clientWidth;
     }
 
     function ageSuffix(year) {
@@ -841,6 +893,71 @@
         const age = new Date().getFullYear() - year;
         if (age <= 0) return '';
         return age + (age === 1 ? ' yr old' : ' yrs old');
+    }
+
+    /* ---------------------------------------------------------------------- *
+     * km/year pill
+     *
+     * Odometer alone is hard to judge - 70,000 km is a lot on a 2021 car and
+     * unremarkable on a 2013 one. Yearly running makes the comparison fair.
+     * The pill sits under the wishlist heart, in the same absolutely-positioned
+     * corner of the photo, where there is always empty sky or bodywork.
+     * ---------------------------------------------------------------------- */
+
+    const KM_PILL = 'data-c24ce-km';
+
+    function kmPerYear(car) {
+        const km = car.odometer && typeof car.odometer.value === 'number' ? car.odometer.value : null;
+        if (!km || !car.year) return null;
+        // Count the current year as one, so a brand-new car never divides by zero.
+        const years = Math.max(1, new Date().getFullYear() - car.year);
+        return Math.round(km / years);
+    }
+
+    function addKmPill(card, car) {
+        if (card.querySelector('[' + KM_PILL + ']')) return;
+
+        const perYear = kmPerYear(car);
+        if (!perYear) return;
+
+        // The heart lives in an absolutely positioned box at top:8px right:8px; its offset parent
+        // is the thumbnail. Hang the pill off that same parent so it tracks the heart.
+        const heartBox = card.querySelector('.styles_outer__ZH1Cg');
+        const host = heartBox && heartBox.parentElement && heartBox.parentElement.parentElement;
+        if (!host) return;
+        if (!host.style.position) host.style.position = 'relative';
+
+        const ratio = perYear / CONFIG.avgKmPerYear;
+        const tone = ratio <= 0.75
+            ? { fg: '#1B6B4A', bg: 'rgba(232,248,240,0.94)' }   // easy life
+            : ratio >= 1.4
+                ? { fg: '#A33A2B', bg: 'rgba(253,236,233,0.94)' } // worked hard
+                : { fg: '#3F4145', bg: 'rgba(255,255,255,0.94)' };
+
+        const pill = document.createElement('div');
+        pill.setAttribute(KM_PILL, '1');
+        pill.style.cssText = [
+            'position:absolute',
+            'top:40px',            // clears the 24px heart at top:8px
+            'right:8px',
+            'z-index:9',
+            'padding:2px 6px',
+            'border-radius:6px',
+            'background:' + tone.bg,
+            'color:' + tone.fg,
+            'font-size:11px',
+            'line-height:13px',
+            'font-weight:var(--semibold, 600)',
+            'text-align:right',
+            'white-space:nowrap',
+            'pointer-events:none',
+            'box-shadow:0 1px 3px rgba(0,0,0,0.12)',
+        ].join(';');
+        pill.innerHTML =
+            '<span>' + fmt.grouped(perYear) + '</span>' +
+            '<span style="font-weight:var(--regular, 400);opacity:0.75"> km/yr</span>';
+
+        host.appendChild(pill);
     }
 
     /* ---------------------------------------------------------------------- *
@@ -869,6 +986,9 @@
         const info = car.additionalInfo || {};
         if (info.showOtherCharges === false || car.businessVertical === 'C2C') return;
 
+        // Yearly running needs nothing from the network, so show it straight away.
+        addKmPill(card, car);
+
         const node = labelNodeOf(card);
         if (!node) return;
 
@@ -885,33 +1005,45 @@
             : '';
         let tooltip = 'Total ' + fmt.rupees(total) + (chargeList ? ' — incl. ' + chargeList : '');
 
-        // Feature [2] is done. Paint it now; feature [1] refines the suffix if it earns it.
+        // Show the price straight away; the new-car comparison refines the tail if it earns it.
         let suffix = ageSuffix(car.year);
-        render(card, node, { main, suffix }, tooltip);
+        render(card, node, { main, suffix, total }, tooltip);
 
         if (!car.make || !car.model) return;
 
         try {
             const res = await newCarCatalog.priceFor(car, total);
-            if (res && typeof res.pct === 'number') {
-                const approx = res.cityMatched ? '' : '~';
-                suffix = approx + res.pct + '% off';
+
+            // Only a result carrying a real price is a match. Rejections may also carry a pct for
+            // debugging, so checking that field alone would print the number we just refused.
+            if (res && res.newPrice && res.variantName && typeof res.pct === 'number') {
+                suffix = (res.cityMatched ? '' : '~') + res.pct + '% off';
                 tooltip +=
-                    '\n' + res.pct + '% below new ' + res.variantName +
-                    ' (' + fmt.rupees(res.newPrice) + ' on-road' +
-                    (res.cityMatched && res.citySlug ? ', ' + res.citySlug : ', Delhi-NCR basis') + ').';
+                    '\n' + res.pct + '% cheaper than a new ' + res.variantName + ' at ' +
+                    fmt.rupees(res.newPrice) + ' on-road' +
+                    (res.cityMatched && res.citySlug ? ' in ' + titleCase(res.citySlug) : ' (Delhi-NCR)') + '.';
+
+            } else if (res && res.discontinued) {
+                // Nothing to compare against - say so plainly instead of leaving a gap.
+                suffix = 'not sold new';
+                tooltip += '\nThe ' + car.make + ' ' + car.model + ' is not sold new any more, ' +
+                           'so there is no new price to compare against.';
+
             } else if (res && res.range) {
-                // Variant could not be matched honestly - show the model's range in the tooltip
-                // instead of inventing a single percentage.
+                suffix = ageSuffix(car.year);
                 tooltip +=
-                    '\nNew ' + car.make + ' ' + car.model + ': ' +
-                    fmt.lakh(res.range.min) + ' – ' + fmt.lakh(res.range.max) + ' on-road.';
+                    '\nA new ' + car.make + ' ' + car.model + ' runs ' +
+                    fmt.lakh(res.range.min) + ' to ' + fmt.lakh(res.range.max) + ' on-road, but the ' +
+                    'trim names have changed too much to compare this one directly.';
+
             } else if (res && res.reason) {
-                LOG(appId, car.make, car.model, car.year, '->', res.reason);
+                LOG(appId, car.make, car.model, car.year, '->', res.reason,
+                    res.rejectedPct ? res.rejectedPct + '% > ' + res.ceiling + '% ceiling' : '');
             }
-            render(card, node, { main, suffix }, tooltip);
+
+            render(card, node, { main, suffix, total }, tooltip);
         } catch (e) {
-            LOG('newcar lookup failed', e);
+            LOG('new-car lookup failed', e);
         }
     }
 
@@ -953,6 +1085,7 @@
     }
 
     function start() {
+        store.sweep();
         scan();
 
         new MutationObserver(scanSoon).observe(document.body, { childList: true, subtree: true });
