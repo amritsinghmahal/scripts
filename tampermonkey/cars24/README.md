@@ -1,11 +1,12 @@
 # Cars24 Card Enricher
 
-A userscript that adds four things to every car card on [cars24.com](https://www.cars24.com):
+A userscript that adds five things to every car card on [cars24.com](https://www.cars24.com):
 
 1. **How much of the price is fees** — not the car, the paperwork.
 2. **How much cheaper it is than buying that model new** — but only when that comparison is honest.
 3. **How hard the car has been driven** — kilometres per year, not just total odometer.
 4. **How long it has been up for sale** — a car that has sat for months is negotiable.
+5. **How many people have shortlisted it** — the count behind the heart icon.
 
 ![what it looks like](docs/preview.png)
 
@@ -27,7 +28,7 @@ before        ₹8.56L   ₹7.38 lakh
               Includes RC transfer & more
 
 after         ₹8.56L   ₹7.38 lakh
-              incl. ₹50.5k fees · 5 yrs old
+              incl. ₹50.5k fees · 26% off
 ```
 
 Hover it for the itemised version:
@@ -39,7 +40,7 @@ Same numbers the site's own price popup shows. You just don't have to open it on
 
 ---
 
-## The four things it shows
+## The five things it shows
 
 ### 1. The fee split
 
@@ -81,9 +82,13 @@ So the script only shows a percentage when it can stand behind it:
   Anything above that says more about years of price rises than about this particular car, so it is
   dropped.
 
-Fail any of those and you get the plain facts instead — the car's age, or `not sold new`. **No
-number is better than a wrong number.** Expect the percentage on recent cars; older stock mostly
-shows its age instead.
+Where the trim names have been rewritten between generations, it falls back to the cheapest current
+trim with the same fuel and gearbox — the least you could pay for that car new today — and marks it
+with a `~`.
+
+Fail all of that and you get one of two honest answers instead: `not sold new` when the model has
+left the market, or the model's current price range (`new ₹10.2-15.1L`) when it is still sold but no
+single figure would be defensible. **No number is better than a wrong number.**
 
 When it does appear, it compares like with like: your city's on-road price against the used car's
 true total, both including taxes and registration.
@@ -114,6 +119,21 @@ back, and the sequence is perfectly monotonic across every card — it is the co
 So this is an exact date, not an estimate.
 
 The numbers are real ones, not derived: observed ages on a single Pune page ran from 2 days to 175.
+
+### 5. How many people saved it
+
+A third pill with the count behind the heart icon — how many shoppers have shortlisted that car.
+Observed range on one page: 10 to 610.
+
+Read it together with days-listed. A car with 600 saves after two weeks is genuinely in demand; the
+same 600 after six months just means a lot of people looked and passed. Cars24 rounds the figure to
+the nearest ten, so treat it as a gauge rather than a tally.
+
+This is the one expensive addition. The count only exists on a per-car record of about 89 KB, and it
+is absent from the batched endpoint, so there is no way to share one request across cards. It is
+fetched only for cards you actually scroll to, cached for 12 hours, and folded into the same request
+as the fee breakdown so a card costs one call rather than two. If you would rather not pay for it,
+set `showSaved: false` in the config block at the top.
 
 ---
 
