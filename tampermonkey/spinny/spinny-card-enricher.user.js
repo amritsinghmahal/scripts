@@ -31,6 +31,13 @@
         topUpBatchSize: 40,
         topUpBatchWaitMs: 90,
 
+        // How far outside the viewport a card still counts as worth paying a request for.
+        viewportMargin: 200,
+        // Debounce for the card sweep, and the longest it may be deferred - a continuous
+        // scroll would otherwise keep resetting the timer and starve it indefinitely.
+        scanDebounceMs: 150,
+        scanMaxWaitMs: 500,
+
         avgKmPerYear: 12000,
         freshDays: 14,
         staleDays: 60,
@@ -874,31 +881,28 @@
         return m ? m[1] : null;
     }
 
-    const done = new WeakSet();
+    const enriched = new WeakSet();
+    const toppedUp = new WeakSet();
 
-    function processCard(card) {
-        if (done.has(card) || card.hasAttribute(MARK)) return;
+    function carFor(card) {
+        return tap.get(idOf(card)) || fiber.get(card.closest(SEL.cell) || card);
+    }
 
+    const skip = (car) => car.sold || car.booked || car.soft_unpublish;
+
+    // Everything here is already in the tapped payload, so it costs no request and runs as
+    // soon as the card exists rather than waiting for the card to be looked at.
+    function enrichCard(card) {
         const id = idOf(card);
         if (!id) return;
 
-        const cell = card.closest(SEL.cell) || card;
-        const car = tap.get(id) || fiber.get(cell);
-        if (!car) return;
-        done.add(card);
-
-        if (car.sold || car.booked || car.soft_unpublish) return;
+        const car = carFor(card);
+        if (!car) return;  // Payload has not arrived yet; a later sweep retries.
+        enriched.add(card);
+        if (skip(car)) return;
 
         addPill(card, 'km', kmSpec(car));
         addPill(card, 'owners', ownersSpec(car));
-
-        listingAgeOf(id).then((days) => addPill(card, 'age', ageSpec(days))).catch(() => {});
-
-        topUp.get(id).then((extras) => {
-            if (!extras) return;
-            addPill(card, 'saved', savedSpec(extras.saved));
-            addPill(card, 'ready', readySpec(extras.readyOn));
-        }).catch(() => {});
 
         const p = priceOf(car, shownPriceOf(card));
         if (!p) {
@@ -909,26 +913,63 @@
         renderLine(card, feeText(p), dropSuffix(p));
     }
 
+    // These two cost a request each, so they wait until the card is near the viewport.
+    function topUpCard(card) {
+        const id = idOf(card);
+        if (!id) return;
+
+        const car = carFor(card);
+        if (!car) return;
+        toppedUp.add(card);
+        if (skip(car)) return;
+
+        listingAgeOf(id).then((days) => addPill(card, 'age', ageSpec(days))).catch(() => {});
+
+        topUp.get(id).then((extras) => {
+            if (!extras) return;
+            addPill(card, 'saved', savedSpec(extras.saved));
+            addPill(card, 'ready', readySpec(extras.readyOn));
+        }).catch(() => {});
+    }
+
     /* -- discovery --------------------------------------------------------- */
 
-    const io = new IntersectionObserver((entries) => {
-        for (const e of entries) {
-            if (!e.isIntersecting) continue;
-            io.unobserve(e.target);
-            processCard(e.target);
-        }
-    }, { rootMargin: '200px 0px' });
+    // An IntersectionObserver is the wrong primitive for this grid. Spinny mounts cards
+    // lazily - on a filtered page they can appear twenty seconds in, at zero height - and
+    // the observer's first callback then reports every one of them as not intersecting.
+    // Nothing calls it again, so the whole page stays unenriched. A plain sweep over the
+    // cards that exist right now, re-run on anything that could have changed them, cannot
+    // get wedged that way.
+    const nearViewport = (card) => {
+        const r = card.getBoundingClientRect();
+        if (!r.width && !r.height) return false;
+        const margin = CONFIG.viewportMargin;
+        return r.bottom > -margin && r.top < (window.innerHeight || 0) + margin;
+    };
 
     function scan() {
-        for (const c of document.querySelectorAll(SEL.card + ':not([' + MARK + '])')) {
-            if (!done.has(c)) io.observe(c);
+        for (const card of document.querySelectorAll(SEL.card)) {
+            if (!enriched.has(card)) enrichCard(card);
+            if (!toppedUp.has(card) && nearViewport(card)) topUpCard(card);
         }
     }
 
     let scanTimer = null;
+    let scanAskedAt = 0;
     function scanSoon() {
+        const now = Date.now();
+        if (!scanAskedAt) scanAskedAt = now;
+
+        const run = () => {
+            clearTimeout(scanTimer);
+            scanTimer = null;
+            scanAskedAt = 0;
+            scan();
+        };
+
+        if (now - scanAskedAt >= CONFIG.scanMaxWaitMs) return run();
         clearTimeout(scanTimer);
-        scanTimer = setTimeout(scan, 150);
+        scanTimer = setTimeout(run, CONFIG.scanDebounceMs);
     }
 
     function onMutation(records) {
@@ -946,6 +987,10 @@
 
         new MutationObserver(onMutation).observe(document.body, { childList: true, subtree: true });
 
+        // Scrolling is what brings a card into range, so it drives the sweep directly
+        // rather than being inferred from a mutation.
+        window.addEventListener('scroll', scanSoon, { passive: true });
+        window.addEventListener('resize', scanSoon, { passive: true });
         window.addEventListener('popstate', scanSoon);
         for (const m of ['pushState', 'replaceState']) {
             const orig = history[m];
