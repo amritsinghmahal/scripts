@@ -282,7 +282,8 @@ Two other tempting fields, rejected for the same reason:
 1. Install [Tampermonkey](https://www.tampermonkey.net/) (Chrome, Firefox, Edge or Safari).
 2. Open [`spinny-card-enricher.user.js`](spinny-card-enricher.user.js), click **Raw**, and
    Tampermonkey will offer to install it.
-3. Go to [spinny.com](https://www.spinny.com) and browse. Cards fill in as you scroll.
+3. Go to [spinny.com](https://www.spinny.com) and browse. The price line appears as soon as a card
+   does; the days-listed and saved pills fill in as you scroll.
 
 Nothing to configure.
 
@@ -297,19 +298,50 @@ same breakdown the site's own price popup uses. It never sends your data anywher
 listens to that call and gets the full car object for every card at no network cost of its own. That is
 why it runs at `document-start`: the first listing request lands about 700 ms later, and the app bundles
 are `async` scripts at the tail of a 1.8 MB document, so the tap is in place long before anything can
-call through it. If it ever misses one, React's own fiber still holds the car object on the card node,
-one hop down.
+call through it.
+
+There are three data sources, in cost order, because relying on the first one alone turned out to be a
+mistake. The tap is free but only sees requests made *after* it is installed, and a userscript manager
+cannot always guarantee it wins that race. So if the tap has no car for a card, React's own fiber still
+holds the object on the card node one hop down — also free. And if even that fails, the script asks for
+the car by id through the same batched `ids=` endpoint it already uses, which folds the result back into
+the tap so the next sweep enriches the card normally. That last hop is what makes the script independent
+of *when* it loaded: injecting it into a page that has already finished loading still enriches every
+card, at the cost of one extra request per 40 of them.
 
 It listens to `fetch` as well as XHR, because a car's own page pulls its similar-cars payload that way
 (`/v3/api/search/listing/<id>/related/v5`) — but that is belt-and-braces. In testing, that strip never
-actually rendered card components, so the script is verified on listing and search pages only. Where
-cards do appear, they appear with the same class names, and it would pick them up.
+actually rendered card components, so the script is verified on listing and search pages only.
+
+**The favourites and recent-view pages are not supported, deliberately.** They do not reuse the listing
+card: their cards are built entirely from `ds-*` utility classes with no CSS-module names at all — no
+`carListingCardV2Root` to find them by, no `productDetailContainer` to attach the line to, and no
+shortlist-icon to read the car's id from. Every anchor the script relies on is absent, so supporting
+them would mean a second, structural way of recognising a card, and a second way of laying the line out.
+That is real work for a page where you are re-reading cars you have already compared, so it is left
+alone. Note the Similar Cars strip on those pages *does* use the listing card and does get enriched —
+which is why the page looks half-done rather than untouched.
 
 **It is polite.** Four requests in flight at most, with a gap between them, and results cached in your
 browser. The shortlist count and ready-by date come from one batched request per 40 cards — the
 endpoint the site itself calls drops those fields, but an older version of it answers the same query
 with them, and honours an undocumented `ids=` filter. Only days-listed costs a request per car, and
 only for cards you actually scroll to. Scrolling back over cars you have already seen costs nothing.
+
+**Nothing waits that doesn't have to.** The all-in price, the fee split and the km/year pill come
+entirely out of the intercepted payload, so they are drawn the moment a card exists rather than when
+you happen to look at it. Only the two enrichments that cost a request — days-listed and the shortlist
+count — wait for a card to come within 200px of the viewport.
+
+This split matters more than it sounds. The first version gated *everything* behind an
+`IntersectionObserver`, and on a filtered result page that failed completely: Spinny mounts the grid
+lazily, so on a URL with filters the cards can appear twenty seconds in and at zero height. The
+observer's first callback then reports every one of them as not intersecting, nothing ever calls it
+again, and the whole page stays blank while the "similar cars" strip below it — mounted later, while
+you are already scrolling — enriches perfectly. Discovery is now a plain sweep over the cards that
+exist right now, re-run on scroll, resize, navigation, DOM mutations, tab focus, and on a two-second
+backstop timer. A sweep is a `WeakSet` check per card, so running it unconditionally costs nothing,
+and unlike the observer it cannot get permanently wedged by a card that mounted at the wrong moment.
 
 **`@grant none` is deliberate.** It puts the script in the page's own realm, which is the only way
 patching `window.XMLHttpRequest` patches the object Spinny's bundles actually call. Any `@grant` at all
@@ -339,6 +371,18 @@ from filenames — `CarListingCardV2__carListingCarContainer`, `LoanDiscountSavi
 survive deploys, and they are byte-identical between the desktop and mobile builds. Selectors are
 matched on substrings where a component has both a V2 and a V3 spelling, so a version bump is handled.
 
+**If something looks wrong, ask the script.** Open the console on a listing page and run:
+
+```js
+spinnyEnricher.status()
+```
+
+`ReferenceError: spinnyEnricher is not defined` means the script is not running at all — check that it
+is enabled in Tampermonkey and that the page was hard-reloaded. Otherwise it reports how many cards are
+on the page, how many got a price line, how many cars the tap captured, and whether the first card has
+data yet, which separates "not running" from "running but finding nothing". `spinnyEnricher.rescan()`
+forces a sweep.
+
 Likely failure modes:
 
 - **The fee line disappears everywhere.** The breakdown changed shape and no candidate matches the
@@ -353,6 +397,11 @@ Likely failure modes:
   depends on it. Do not "fix" this by substituting `latest_publish_date` — see above for why.
 - **The pills overlap the car's name.** The card geometry changed. The stack is sized against a
   measured 52px band between the heart and the title; `maxPills` is the knob.
+- **One section of a page is enriched and another isn't.** Almost always the card-discovery sweep, not
+  the price logic — the enriched section proves the payload, the selectors and the rendering all work.
+  Turn on `debug: true`: silence for the blank section means the sweep never reached those cards, while
+  a "price not decomposable" line per card means it reached them and declined. If it is the sweep,
+  `sweepMs` is the backstop interval.
 
 One quirk worth recording, because it looks like a bug and isn't: Spinny's own check for whether a sale
 is still running splits `end_time` on a `"T"` that its own space-separated timestamps do not contain,

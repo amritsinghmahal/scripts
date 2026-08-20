@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Spinny Card Enricher
 // @namespace    spinny-card-enricher
-// @version      1.0.0
+// @version      1.2.1
 // @description  Shows what a Spinny car actually costs all-in, how much of it is fees, km/year, how long it has been listed, how many people saved it - and strips the sale-discount pill and the "Save extra" loan banner off every card.
 // @match        https://www.spinny.com/*
 // @grant        none
@@ -37,6 +37,9 @@
         // scroll would otherwise keep resetting the timer and starve it indefinitely.
         scanDebounceMs: 150,
         scanMaxWaitMs: 500,
+        // Backstop sweep. Every event-driven trigger is a guess about when Spinny changes
+        // the grid; this one needs no guess to be right.
+        sweepMs: 2000,
 
         avgKmPerYear: 12000,
         freshDays: 14,
@@ -890,16 +893,31 @@
 
     const skip = (car) => car.sold || car.booked || car.soft_unpublish;
 
+    const carRequested = new Set();
+
+    // Third data source, and the one that makes the script independent of timing. If neither
+    // the tap nor React's fiber can produce the car, ask for it by id: the batched top-up
+    // folds everything it fetches back into the tap, so the next sweep enriches the card the
+    // ordinary way. The tap only sees requests made after it is installed, and a userscript
+    // manager cannot always guarantee that it wins that race - without this, losing the race
+    // once means the page is never enriched at all.
+    function requestCar(id) {
+        if (!id || carRequested.has(id)) return;
+        carRequested.add(id);
+        topUp.get(id).catch(() => {});
+    }
+
     // Everything here is already in the tapped payload, so it costs no request and runs as
-    // soon as the card exists rather than waiting for the card to be looked at.
+    // soon as the card exists rather than waiting for the card to be looked at. Returns
+    // whether the car was resolved, so the caller can go and fetch it if it was not.
     function enrichCard(card) {
         const id = idOf(card);
-        if (!id) return;
+        if (!id) return true;  // Not a card we can key; nothing to fetch either.
 
         const car = carFor(card);
-        if (!car) return;  // Payload has not arrived yet; a later sweep retries.
+        if (!car) return false;
         enriched.add(card);
-        if (skip(car)) return;
+        if (skip(car)) return true;
 
         addPill(card, 'km', kmSpec(car));
         addPill(card, 'owners', ownersSpec(car));
@@ -907,10 +925,11 @@
         const p = priceOf(car, shownPriceOf(card));
         if (!p) {
             LOG(id, car.make, car.model, '-> price not decomposable, leaving the card alone');
-            return;
+            return true;
         }
 
         renderLine(card, feeText(p), dropSuffix(p));
+        return true;
     }
 
     // These two cost a request each, so they wait until the card is near the viewport.
@@ -947,11 +966,23 @@
         return r.bottom > -margin && r.top < (window.innerHeight || 0) + margin;
     };
 
-    function scan() {
-        for (const card of document.querySelectorAll(SEL.card)) {
-            if (!enriched.has(card)) enrichCard(card);
+    // Each card is isolated. One card that throws - an unfamiliar payload, a node React is
+    // midway through replacing - must never take the rest of the page with it, and must not
+    // be retried forever either, or every sweep dies at the same card.
+    function sweepCard(card) {
+        try {
+            if (!enriched.has(card) && !enrichCard(card)) requestCar(idOf(card));
             if (!toppedUp.has(card) && nearViewport(card)) topUpCard(card);
+        } catch (e) {
+            enriched.add(card);
+            toppedUp.add(card);
+            LOG('card threw, skipping it', e);
         }
+    }
+
+    function scan() {
+        if (document.hidden) return;
+        document.querySelectorAll(SEL.card).forEach(sweepCard);
     }
 
     let scanTimer = null;
@@ -981,9 +1012,11 @@
         }
     }
 
+    // Order matters: every trigger is registered before the first sweep runs. Sweeping first
+    // would mean a throw in that sweep silently costs us the observer, the listeners and the
+    // backstop timer - one bad card at load, and the script is dead for the whole session.
     function start() {
-        store.drop(true);
-        scan();
+        try { store.drop(true); } catch (_) {}
 
         new MutationObserver(onMutation).observe(document.body, { childList: true, subtree: true });
 
@@ -992,6 +1025,14 @@
         window.addEventListener('scroll', scanSoon, { passive: true });
         window.addEventListener('resize', scanSoon, { passive: true });
         window.addEventListener('popstate', scanSoon);
+        document.addEventListener('visibilitychange', scanSoon);
+
+        // The events above cover everything observed, but they are still a model of how
+        // Spinny behaves, and this page has already broken one such model. The sweep is a
+        // WeakSet check per card, so running it unconditionally costs nothing and removes
+        // the need for the model to be complete.
+        setInterval(scan, CONFIG.sweepMs);
+
         for (const m of ['pushState', 'replaceState']) {
             const orig = history[m];
             history[m] = function (...args) {
@@ -1000,6 +1041,8 @@
                 return r;
             };
         }
+
+        scan();
     }
 
     if (document.readyState === 'loading') {
@@ -1007,6 +1050,31 @@
     } else {
         start();
     }
+
+    // Support hook. This script has now failed twice for reasons invisible from the outside -
+    // a wedged observer, then a suspected lost race for the network tap - and both times the
+    // only way to tell "not running" from "running but finding nothing" was to guess. Run
+    // spinnyEnricher.status() in the console and it says which.
+    window.spinnyEnricher = {
+        version: '1.2.1',
+        status() {
+            const cards = document.querySelectorAll(SEL.card);
+            const withLine = document.querySelectorAll('[' + LINE + ']').length;
+            return {
+                running: true,
+                cardsOnPage: cards.length,
+                cardsWithPriceLine: withLine,
+                carsFromTap: tap.cars.size,
+                tapInstalled: !!XMLHttpRequest.prototype[MARK] && !!window.fetch[MARK],
+                promoCssInjected: !!document.getElementById('spce-css'),
+                idOfFirstCard: cards[0] ? idOf(cards[0]) : null,
+                firstCardHasData: cards[0] ? !!carFor(cards[0]) : null,
+                pageHidden: document.hidden,
+            };
+        },
+        rescan: scan,
+        CONFIG,
+    };
 
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
