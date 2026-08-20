@@ -1,217 +1,98 @@
 // ==UserScript==
 // @name         Spinny Card Enricher
-// @namespace    spinny-card-enricher
-// @version      1.2.1
-// @description  Shows what a Spinny car actually costs all-in, how much of it is fees, km/year, how long it has been listed, how many people saved it - and strips the sale-discount pill and the "Save extra" loan banner off every card.
+// @namespace    https://github.com/amritsinghmahal/scripts
+// @version      2.0.0
+// @description  Splits out the fees baked into every Spinny price, shows what is still owed on top of the figure printed on the card, and adds km/year, days listed, owners, any price cut and the ready-by date.
 // @match        https://www.spinny.com/*
-// @grant        none
-// @run-at       document-start
+// @connect      api.spinny.com
+// @connect      www.spinny.com
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @run-at       document-idle
 // @noframes
 // ==/UserScript==
 
-// @grant none is load-bearing: it keeps us in the page realm, where the taps below see Spinny's calls.
+// The previous version tapped window.XMLHttpRequest at document-start to read Spinny's own
+// listing calls, which meant winning a race it could not be guaranteed to win. It asks the
+// API for the cars itself instead: api.spinny.com answers an undocumented ?ids= filter and
+// returns access-control-allow-origin: https://www.spinny.com, so a plain fetch from the page
+// works and nothing depends on when the script loaded.
 
 (function () {
     'use strict';
 
     const CONFIG = {
-        topUpApi: 'https://api.spinny.com/v3/api/listing/v3/',
+        // Everything except days-listed comes from this one batched call - 40 ids at a time,
+        // about 18 KB gzipped. ?ids= is undocumented but honoured.
+        listApi: 'https://api.spinny.com/v3/api/listing/v3/',
+        // v3 carries available_on and the widest record. v7 is what the site itself calls now
+        // and answers the same query, so it stands in if v3 is ever retired.
+        listApiFallback: 'https://api.spinny.com/v3/api/listing/v7/',
+        // added_on lives here and nowhere else. See daysListedOf().
         detailApi: 'https://www.spinny.com/api/product-detail/fetch-page-data/',
-        showAge: true,
+
+        // The one enrichment that costs a request per car. Set false to make the script pay
+        // nothing beyond one call per 40 cards.
+        showDaysListed: true,
 
         ttl: {
-            topUp: 6 * 60 * 60 * 1000,
-            topUpFail: 30 * 60 * 1000,
+            car: 6 * 60 * 60 * 1000,
+            carFail: 30 * 60 * 1000,
+            // A first-listing date cannot change, so the day count is recomputed locally from
+            // a month-old cache rather than re-fetched.
             addedOn: 30 * 24 * 60 * 60 * 1000,
             addedOnFail: 60 * 60 * 1000,
         },
 
         maxConcurrent: 4,
         requestGapMs: 120,
-        topUpBatchSize: 40,
-        topUpBatchWaitMs: 90,
+        batchSize: 40,
+        batchWaitMs: 90,
 
         // How far outside the viewport a card still counts as worth paying a request for.
-        viewportMargin: 200,
-        // Debounce for the card sweep, and the longest it may be deferred - a continuous
-        // scroll would otherwise keep resetting the timer and starve it indefinitely.
+        viewportMargin: 250,
+        // Debounce for the sweep, and the longest it may be deferred - a continuous scroll
+        // would otherwise keep resetting the timer and starve it indefinitely.
         scanDebounceMs: 150,
-        scanMaxWaitMs: 500,
-        // Backstop sweep. Every event-driven trigger is a guess about when Spinny changes
-        // the grid; this one needs no guess to be right.
-        sweepMs: 2000,
+        scanMaxWaitMs: 600,
+        // Backstop sweep. Every event-driven trigger is a guess about when Spinny changes the
+        // grid; this one needs no guess to be right.
+        sweepMs: 1500,
 
         avgKmPerYear: 12000,
         freshDays: 14,
         staleDays: 60,
-        minPriceDrop: 10000,
-        maxPills: 3,
-
-        hideSalePill: true,
-        hideLoanBanner: true,
-        hideSlashedPrice: false,
+        minPriceCut: 5000,
 
         debug: false,
     };
 
     const LOG = (...a) => { if (CONFIG.debug) console.log('[spce]', ...a); };
 
+    // Spinny rebuilt the listing card on a design system of ds-* utility classes, so the
+    // CSS-module names the old version matched on (carListingCardV2Root, productDetailContainer,
+    // priceWithRupeeSymbol) are all gone. What replaced them is better: ids and data-attributes
+    // with semantic names, one set per card. Matched on a prefix so a -v3 bump still finds them.
+    // Two card components are in play and they mark themselves differently: the grid card on
+    // listing, search and home pages, and CarListingCardV3New in the similar-cars strip on a
+    // car's own page, which lays the photo beside the details instead of above them.
     const SEL = {
-        cell: '.CarListingDesktop__carListingCarWrapper',
-        card: '[class*="carListingCardV2Root"],[class*="carListingCardV3Root"]',
-        body: '[class*="carListingCarContainer"]',
-        detail: '[class*="productDetailContainer"]',
-        heart: '[data-id="shortlist_icon"]',
+        card: '[data-base-component="card"],[data-id-componentname]',
+        detail: '[id^="listing-detail-card"]',
+        heart: '[id="shortlist_icon"]',
         link: 'a[href*="/buy-used-cars/"]',
-        price: '[class*="priceWithRupeeSymbol"]',
+        title: 'h2',
     };
 
-    const MARK = 'data-spce';
-    const PILL_STACK = 'data-spce-pills';
-    const LINE = 'data-spce-line';
-
-    /* -- promo removal ------------------------------------------------------ */
-
-    // CSS, not node removal: React re-renders these cards, and !important beats Spinny's inline styles.
-    function stripPromos() {
-        if (document.getElementById('spce-css')) return;
-
-        const rules = [];
-
-        if (CONFIG.hideSalePill) {
-            rules.push('[class*="specialOfferBadgeWrapper"]{display:none!important}');
-        }
-
-        if (CONFIG.hideLoanBanner) {
-            rules.push('[class*="savingsWithLoanCampaign"]{display:none!important}');
-            rules.push(
-                'li[class*="ListingPricingDetail__emi"],li[class*="ListingPricingDetail__userEmi"]' +
-                '{background:none!important;border-color:transparent!important;' +
-                'border-radius:0!important;color:#2e054e!important;padding-left:0!important}'
-            );
-        }
-
-        if (CONFIG.hideSlashedPrice) {
-            rules.push('[class*="slashedPrice"]{display:none!important}');
-        }
-
-        if (!rules.length) return;
-
-        const style = document.createElement('style');
-        style.id = 'spce-css';
-        style.textContent = rules.join('\n');
-
-        const mount = document.head || document.documentElement;
-        if (mount) {
-            mount.appendChild(style);
-        } else {
-            document.addEventListener('DOMContentLoaded', () => {
-                (document.head || document.documentElement).appendChild(style);
-            }, { once: true });
-        }
-    }
-
-    /* -- the network tap --------------------------------------------------- */
-
-    const tap = {
-        cars: new Map(),
-
-        install() {
-            this.wrapXhr();
-            this.wrapFetch();
-        },
-
-        harvest(data) {
-            if (!data || typeof data !== 'object') return;
-
-            const take = (car) => {
-                if (car && typeof car === 'object' && car.id && car.make) this.merge(String(car.id), car);
-            };
-
-            for (const list of [data.results, data.data, data.content, data.cars]) {
-                if (Array.isArray(list)) list.forEach(take);
-            }
-
-            const byId = data.listById || (data.productList && data.productList.listById);
-            if (byId && typeof byId === 'object') Object.values(byId).forEach(take);
-        },
-
-        merge(id, car) {
-            const prev = this.cars.get(id);
-            this.cars.set(id, prev ? { ...prev, ...car } : car);
-        },
-
-        wrapXhr() {
-            const XHR = window.XMLHttpRequest;
-            if (!XHR || !XHR.prototype || XHR.prototype[MARK]) return;
-            const send = XHR.prototype.send;
-
-            XHR.prototype.send = function (...args) {
-                this.addEventListener('load', () => {
-                    try {
-                        // Reading responseText on a responseType:"json" request throws; use .response.
-                        const body = this.responseType === 'json'
-                            ? this.response
-                            : JSON.parse(this.responseText);
-                        tap.harvest(body);
-                        if (tap.cars.size) scanSoon();
-                    } catch {}
-                });
-                return send.apply(this, args);
-            };
-            XHR.prototype[MARK] = 1;
-        },
-
-        wrapFetch() {
-            const orig = window.fetch;
-            if (typeof orig !== 'function' || orig[MARK]) return;
-
-            const wrapped = function (...args) {
-                return orig.apply(this, args).then((res) => {
-                    // Clone: reading the body here would consume the caller's copy of it.
-                    try {
-                        res.clone().json().then((body) => {
-                            tap.harvest(body);
-                            if (tap.cars.size) scanSoon();
-                        }, () => {});
-                    } catch {}
-                    return res;
-                });
-            };
-            wrapped[MARK] = 1;
-            window.fetch = wrapped;
-        },
-
-        get(id) { return this.cars.get(id) || null; },
-    };
-
-    tap.install();
-    stripPromos();
-
-    /* -- the React fallback ------------------------------------------------ */
-
-    const fiber = {
-        get(cell) {
-            try {
-                const key = Object.keys(cell).find((k) => k.startsWith('__reactFiber$'));
-                if (!key) return null;
-
-                let node = cell[key];
-                for (let depth = 0; node && depth < 8; depth++) {
-                    const props = node.memoizedProps;
-                    if (props && props.id && props.make && props.model) return props;
-                    node = node.child;
-                }
-            } catch {}
-            return null;
-        },
-    };
+    const BLOCK = 'data-spce';
 
     /* -- storage ----------------------------------------------------------- */
 
-    // Every localStorage touch is wrapped: it throws outright in private mode and once quota is full.
+    // Every localStorage touch is wrapped: it throws outright in private mode and once the
+    // origin's quota is full.
     const store = {
-        SCHEMA: 'v1',
+        // Bump when a cached record changes shape; older entries are then swept, not read.
+        SCHEMA: 'v2',
         PREFIX: 'spce:',
         key(k) { return this.PREFIX + this.SCHEMA + ':' + k; },
 
@@ -219,9 +100,9 @@
             const mine = this.key('');
             try {
                 Object.keys(localStorage)
-                    .filter((k) => k.startsWith(this.PREFIX) && !(staleOnly && k.startsWith(mine)))
+                    .filter((k) => k.indexOf(this.PREFIX) === 0 && !(staleOnly && k.indexOf(mine) === 0))
                     .forEach((k) => localStorage.removeItem(k));
-            } catch {}
+            } catch (e) { /* private mode */ }
         },
 
         get(k) {
@@ -236,8 +117,8 @@
                     return null;
                 }
                 return rec.v;
-            } catch {
-                try { localStorage.removeItem(this.key(k)); } catch {}
+            } catch (e) {
+                try { localStorage.removeItem(this.key(k)); } catch (_) {}
                 return null;
             }
         },
@@ -246,20 +127,21 @@
             const write = () => localStorage.setItem(this.key(k), JSON.stringify({ v, ts: Date.now(), ttl }));
             try {
                 write();
-            } catch {
+            } catch (e) {
                 this.evictCheap();
-                try { write(); } catch {}
+                try { write(); } catch (_) { /* the cache is an optimisation */ }
             }
         },
 
-        // added_on costs a 27 KB fetch to rebuild and never goes stale, so the top-ups go first.
+        // A car record costs one fortieth of an 18 KB call to rebuild; a listing date costs a
+        // 200 KB one. So the car records go first.
         evictCheap() {
-            const keep = this.key('ao:');
+            const dear = this.key('age:');
             try {
-                const mine = Object.keys(localStorage).filter((k) => k.startsWith(this.PREFIX));
-                const cheap = mine.filter((k) => !k.startsWith(keep));
+                const mine = Object.keys(localStorage).filter((k) => k.indexOf(this.PREFIX) === 0);
+                const cheap = mine.filter((k) => k.indexOf(dear) !== 0);
                 (cheap.length ? cheap : mine).forEach((k) => localStorage.removeItem(k));
-            } catch {}
+            } catch (e) {}
         },
     };
 
@@ -268,25 +150,34 @@
     const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
     const fmt = {
+        // 717885 -> "7,17,885"
         grouped(n) {
             const s = String(Math.round(n));
             if (s.length <= 3) return s;
             return s.slice(0, -3).replace(/\B(?=(\d{2})+(?!\d))/g, ',') + ',' + s.slice(-3);
         },
 
+        // 717885 -> "₹7.18L"
         lakh(n) {
             const l = n / 100000;
             if (l >= 100) return '₹' + (l / 100).toFixed(2) + 'Cr';
             return '₹' + l.toFixed(2) + 'L';
         },
 
+        // 34591 -> "₹34.6k", 8421 -> "₹8.4k", 940 -> "₹940"
         compact(n) {
             if (n >= 100000) return this.lakh(n);
-            if (n >= 10000) return '₹' + (n / 1000).toFixed(1) + 'k';
+            if (n >= 1000) return '₹' + (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
             return '₹' + this.grouped(n);
         },
 
         rupees(n) { return '₹' + this.grouped(n); },
+
+        // 13925 -> "13.9K", to read alongside the card's own "57K km" badge.
+        km(n) {
+            if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+            return this.grouped(n);
+        },
 
         day(iso) {
             const t = parseIst(iso);
@@ -302,7 +193,7 @@
         },
     };
 
-    // Spinny's timestamps are naive IST strings, so the +05:30 offset has to be stated explicitly.
+    // Spinny's timestamps are naive IST strings, so the +05:30 offset has to be stated.
     function parseIst(s) {
         if (!s) return null;
         const t = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(s) ? s : String(s).replace(' ', 'T') + '+05:30');
@@ -312,7 +203,7 @@
     function daysSince(iso) {
         const t = parseIst(iso);
         if (t === null) return null;
-        // floor here, ceil in daysUntil: a car added four hours ago was listed today, not yesterday.
+        // Floor here, ceil in daysUntil: a car added four hours ago was listed today.
         return Math.max(0, Math.floor((Date.now() - t) / 86400000));
     }
 
@@ -346,24 +237,52 @@
                 };
 
                 job.fn().then(
-                    (value) => { release(); job.resolve(value); },
-                    (err) => { release(); job.reject(err); }
+                    (v) => { release(); job.resolve(v); },
+                    (e) => { release(); job.reject(e); }
                 );
             }
         },
     };
 
+    function httpError(status) {
+        const e = new Error('HTTP ' + status);
+        e.status = status;
+        return e;
+    }
+
+    // Both hosts send access-control-allow-origin for www.spinny.com, so plain fetch works and
+    // is the fast path. GM_xmlhttpRequest is the fallback for the day that changes.
+    // credentials are omitted deliberately: none of this needs the account.
     function httpGet(url) {
-        return fetch(url, { credentials: 'omit' }).then((r) => {
-            if (!r.ok) {
-                const e = new Error('HTTP ' + r.status);
-                e.status = r.status;
-                throw e;
-            }
-            return r.json();
+        return fetch(url, { credentials: 'omit' })
+            .then((r) => {
+                if (!r.ok) throw httpError(r.status);
+                return r.json();
+            })
+            .catch((err) => {
+                if (err && err.status) throw err;
+                return gmGet(url);
+            });
+    }
+
+    function gmGet(url) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') return reject(new Error('no GM'));
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                onload: (r) => {
+                    if (r.status < 200 || r.status >= 300) return reject(httpError(r.status));
+                    try { resolve(JSON.parse(r.responseText)); }
+                    catch (e) { reject(e); }
+                },
+                onerror: reject,
+                ontimeout: reject,
+            });
         });
     }
 
+    // settle(err, raw) returns { v } to hand back uncached, or { v, ttl } to remember first.
     const inflight = new Map();
 
     function cachedFetch(cacheKey, request, settle) {
@@ -383,22 +302,139 @@
         return p;
     }
 
-    /* -- the top-up -------------------------------------------------------- */
+    /* -- the price --------------------------------------------------------- */
 
-    const topUp = {
+    const num = (v) => (typeof v === 'number' && isFinite(v) ? v : 0);
+
+    // One add-on's value is the string "included", so anything non-numeric counts as zero.
+    const sumLines = (list) => (Array.isArray(list) ? list.reduce((t, l) => t + num(l && l.value), 0) : 0);
+
+    // Spinny's price is four quantities deep and the card prints the second one:
+    //
+    //   base_listing_price                       the car
+    // + base_add_on_data_list                    servicing, warranty, FASTag, fuel
+    // = listing_price_without_tax                <- WHAT THE CARD SHOWS
+    // + mandatory_paid_add_ons_data_list         RC transfer, insurance
+    // + tax_add_on_data_list                     TCS, and a transfer_tax in Gujarat
+    // = listing_price_without_gst
+    // + gst                                      GST on the whole lot
+    // = listing_price                            <- WHAT YOU ACTUALLY PAY
+    //
+    // Both identities hold on 420 of 420 cars sampled across seven cities, so the stated
+    // totals are taken as authoritative and the line items only itemise them for the tooltip.
+    function priceOf(car) {
+        const v3 = car.price_breakdown_v3;
+        const b = v3 || car.price_breakdown_v2;
+        if (!b) return null;
+
+        const base = num(b.base_listing_price);
+        const inside = sumLines(b.base_add_on_data_list);
+        const mandatory = sumLines(b.mandatory_paid_add_ons_data_list);
+        const taxes = sumLines(b.tax_add_on_data_list);
+        const gst = num(b.gst && b.gst.value);
+
+        const allIn = num(b.listing_price) || base + inside + mandatory + taxes + gst;
+        // v2 names this field for a different quantity - it folds the mandatory add-ons in -
+        // so only v3 can say what the card is printing. Without v3 no on-top figure is claimed.
+        const shown = v3 ? num(v3.listing_price_without_tax) || base + inside : 0;
+
+        if (!(base > 0) || !(allIn >= base)) return null;
+
+        const lines = [];
+        const add = (l, where) => {
+            if (!l || !l.display_name) return;
+            lines.push({
+                label: l.display_name,
+                amount: typeof l.value === 'number' ? l.value : null,
+                where,
+            });
+        };
+        for (const l of b.base_add_on_data_list || []) add(l, 'in');
+        for (const l of b.mandatory_paid_add_ons_data_list || []) add(l, 'on');
+        for (const l of b.tax_add_on_data_list || []) add(l, 'on');
+        add(b.gst, 'on');
+
+        return {
+            base,
+            allIn,
+            shown: shown > 0 && shown < allIn ? shown : 0,
+            fees: allIn - base,
+            onTop: shown > 0 && shown < allIn ? allIn - shown : 0,
+            lines,
+            sale: saleOf(car),
+            cut: cutOf(car),
+        };
+    }
+
+    // price_breakdown_v2 keeps the previous price alongside the current one, and it moved the
+    // car's own base price rather than the fees, so this is a genuine markdown rather than a
+    // coupon. Nothing on the site displays it.
+    //
+    // is_same_listing_price_update is not the gate it looks like - it reads false on 400 of the
+    // 420 cars sampled, cut or not - so it is ignored. Both operands of each subtraction are
+    // checked for a real value first: listing_price_without_gst is missing on the odd car, and
+    // treating a missing current price as zero reports the entire price as a discount.
+    function cutOf(car) {
+        const v2 = car.price_breakdown_v2;
+        if (!v2) return 0;
+
+        const wasBase = num(v2.original_base_listing_price);
+        const nowBase = num(v2.base_listing_price);
+        const wasTotal = num(v2.original_price);
+        const nowTotal = num(v2.listing_price_without_gst);
+
+        const byBase = wasBase > 0 && nowBase > 0 ? wasBase - nowBase : 0;
+        const byTotal = wasTotal > 0 && nowTotal > 0 ? wasTotal - nowTotal : 0;
+
+        const cut = Math.max(byBase, byTotal);
+        return cut >= CONFIG.minPriceCut ? cut : 0;
+    }
+
+    // Empty on every car sampled, so this only ever adds a line to the tooltip. It is here
+    // because a live sale is exactly when the price on the card needs explaining.
+    function saleOf(car) {
+        for (const d of [car.discount_v3, car.discount]) {
+            if (d && typeof d.value === 'number' && d.value > 0) return d.value;
+        }
+        return 0;
+    }
+
+    // Only what gets drawn is cached, not the 18 KB record it came from: localStorage is a few
+    // megabytes for the whole origin and this has to hold a month of browsing.
+    function distil(car) {
+        const p = priceOf(car);
+        if (!p) return null;
+
+        return {
+            // registration_year, not make_year: the odometer starts running at registration,
+            // and registration year is what the card itself prints.
+            year: num(car.registration_year) || num(car.make_year),
+            km: num(car.mileage),
+            owners: num(car.no_of_owners),
+            readyOn: car.upcoming ? car.available_on || null : null,
+            dead: !!(car.sold || car.soft_unpublish),
+            p,
+        };
+    }
+
+    /* -- car records, batched ---------------------------------------------- */
+
+    const settleAll = (resolvers, value) => (resolvers || []).forEach((r) => r(value));
+
+    const carData = {
         queue: new Map(),
         timer: null,
 
         get(id) {
-            const cached = store.get('tu:' + id);
-            if (cached) return Promise.resolve(cached.miss ? null : cached);
+            const hit = store.get('car:' + id);
+            if (hit) return Promise.resolve(hit.miss ? null : hit.car);
 
             return new Promise((resolve) => {
                 if (!this.queue.has(id)) this.queue.set(id, []);
                 this.queue.get(id).push(resolve);
 
-                if (this.queue.size >= CONFIG.topUpBatchSize) this.flush();
-                else if (!this.timer) this.timer = setTimeout(() => this.flush(), CONFIG.topUpBatchWaitMs);
+                if (this.queue.size >= CONFIG.batchSize) this.flush();
+                else if (!this.timer) this.timer = setTimeout(() => this.flush(), CONFIG.batchWaitMs);
             });
         },
 
@@ -407,58 +443,54 @@
             this.timer = null;
             if (!this.queue.size) return;
 
-            const batch = Array.from(this.queue.keys()).slice(0, CONFIG.topUpBatchSize);
+            const batch = Array.from(this.queue.keys()).slice(0, CONFIG.batchSize);
             const waiting = new Map();
             for (const id of batch) {
                 waiting.set(id, this.queue.get(id));
                 this.queue.delete(id);
             }
 
-            const url = CONFIG.topUpApi + '?ids=' + batch.join(',') + '&size=' + batch.length;
+            const query = '?ids=' + batch.join(',') + '&size=' + batch.length;
 
-            gate.run(() => httpGet(url))
+            gate.run(() => httpGet(CONFIG.listApi + query)
+                    .catch(() => httpGet(CONFIG.listApiFallback + query)))
                 .then((data) => {
                     const found = new Map();
                     for (const car of (data && data.results) || []) {
-                        if (car && car.id) {
-                            found.set(String(car.id), car);
-                            tap.merge(String(car.id), car);
-                        }
+                        if (car && car.id) found.set(String(car.id), car);
                     }
 
                     for (const id of batch) {
-                        const car = found.get(id);
-                        const rec = car
-                            ? {
-                                saved: typeof car.shortlist_count === 'number' ? car.shortlist_count : null,
-                                readyOn: car.upcoming ? car.available_on || null : null,
-                            }
-                            : { miss: true };
-                        store.set('tu:' + id, rec, car ? CONFIG.ttl.topUp : CONFIG.ttl.topUpFail);
-                        this.settle(waiting.get(id), rec.miss ? null : rec);
+                        const raw = found.get(id);
+                        const car = raw ? distil(raw) : null;
+                        // Unknown ids are dropped from the response rather than returned null,
+                        // so a miss is remembered briefly to stop it being asked for again.
+                        store.set('car:' + id, car ? { car } : { miss: true },
+                            car ? CONFIG.ttl.car : CONFIG.ttl.carFail);
+                        settleAll(waiting.get(id), car);
                     }
                 })
-                .catch(() => {
-                    for (const id of batch) this.settle(waiting.get(id), null);
-                })
+                .catch(() => { for (const id of batch) settleAll(waiting.get(id), null); })
                 .then(() => { if (this.queue.size) this.flush(); });
-        },
-
-        settle(resolvers, value) {
-            (resolvers || []).forEach((r) => r(value));
         },
     };
 
     /* -- days listed ------------------------------------------------------- */
 
-    function listingAgeOf(id) {
-        if (!CONFIG.showAge) return Promise.resolve(null);
+    // added_on is the field Spinny's own "Newest First" sort runs on - the sort parameter is
+    // literally o=-added_on. It is on none of the batched endpoints: listing v3, v4, v5, v6, v7
+    // and light/v5 all omit it, and none of them honour a field filter. So this is the one
+    // request the script makes per card, for cards you actually scroll to, cached for a month.
+    //
+    // Do not substitute latest_publish_date. It is a republish stamp and it fails bimodally:
+    // on the car this was written against it reads today, while added_on reads three days ago.
+    function daysListedOf(id) {
+        if (!CONFIG.showDaysListed) return Promise.resolve(null);
 
-        return cachedFetch(
-            'ao:' + id,
+        return cachedFetch('age:' + id,
             () => httpGet(CONFIG.detailApi + encodeURIComponent(id) + '/'),
-            (_err, data) => {
-                const detail = data && (data.productDetail || data.product_detail || data);
+            (err, data) => {
+                const detail = data && (data.productDetail || data.product_detail);
                 const added = detail && detail.added_on;
                 return added
                     ? { v: { added }, ttl: CONFIG.ttl.addedOn }
@@ -467,416 +499,230 @@
         ).then((rec) => (rec && rec.added ? daysSince(rec.added) : null));
     }
 
-    /* -- the price --------------------------------------------------------- */
+    /* -- what gets drawn --------------------------------------------------- */
 
-    // One fee line's value is the string "included", so anything non-numeric has to count as zero.
-    const numeric = (line) => (line && typeof line.value === 'number' ? line.value : 0);
-    const sum = (list) => (Array.isArray(list) ? list.reduce((total, line) => total + numeric(line), 0) : 0);
-
-    const saleLive = (sale) => !!(sale && sale.value > 0 && sale.adjusted_mid_listing_price > 0);
-
-    const HEADLINE_TOLERANCE = 1500;
-
-    // v2 and v3 name different quantities identically - never mix them, and never drop one.
-    function modelsOf(car) {
-        const out = [];
-        if (car.price_breakdown_v3) {
-            out.push({
-                breakdown: car.price_breakdown_v3,
-                sale: car.discount_v3 || car.discount || { value: 0 },
-                version: 'v3',
-            });
-        }
-        if (car.price_breakdown_v2) {
-            out.push({
-                breakdown: car.price_breakdown_v2,
-                sale: car.discount || { value: 0 },
-                version: 'v2',
-            });
-        }
-        return out;
-    }
-
-    function decompose(model) {
-        const { breakdown, sale, version } = model;
-        if (!breakdown || typeof breakdown.base_listing_price !== 'number') return null;
-
-        const discount = saleLive(sale) ? sale.value : 0;
-
-        return {
-            breakdown,
-            sale,
-            version,
-            discount,
-            base: breakdown.base_listing_price - discount,
-            feesInside: sum(breakdown.base_add_on_data_list),
-            mandatory: sum(breakdown.mandatory_paid_add_ons_data_list),
-            taxes: sum(breakdown.tax_add_on_data_list),
-            gst: numeric(breakdown.gst),
-        };
-    }
-
-    function priceOf(car, shownOnCard) {
-        const parts = modelsOf(car).map(decompose).filter(Boolean);
-        if (!parts.length) return null;
-
-        // Both slicings are real: some cards print the inside-only figure, some add mandatory + taxes.
-        const options = parts.flatMap((part) => {
-            const inside = part.base + part.feesInside;
-            return [
-                { part, headline: inside },
-                { part, headline: inside + part.mandatory + part.taxes },
-            ];
-        });
-
-        const pick = shownOnCard
-            ? options.find((o) => Math.abs(o.headline - shownOnCard) <= HEADLINE_TOLERANCE)
-            : options[0];
-        if (!pick) return null;
-
-        const { breakdown, sale, version, discount, base, feesInside, mandatory, taxes, gst } = pick.part;
-        const headline = pick.headline;
-
-        const allIn = base + feesInside + mandatory + taxes + gst;
-        if (!(allIn > 0)) return null;
-
-        const lines = [];
-        const addLine = (line, where) => {
-            if (!line || !line.display_name) return;
-            lines.push({
-                label: line.display_name,
-                amount: typeof line.value === 'number' ? line.value : null,
-                included: line.value === 'included',
-                where,
-            });
-        };
-        for (const line of breakdown.base_add_on_data_list || []) addLine(line, 'inside');
-        for (const line of breakdown.mandatory_paid_add_ons_data_list || []) addLine(line, 'onTop');
-        for (const line of breakdown.tax_add_on_data_list || []) addLine(line, 'onTop');
-        addLine(breakdown.gst, 'onTop');
-
-        return {
-            base,
-            fees: allIn - base,
-            allIn,
-            headline,
-            onTop: allIn - headline,
-            struck: saleLive(sale) ? breakdown.listing_price_without_tax : null,
-            discount,
-            lines,
-            version,
-            drop: priceDropOf(car),
-        };
-    }
-
-    function priceDropOf(car) {
-        const v2 = car.price_breakdown_v2;
-        if (!v2 || v2.is_same_listing_price_update) return null;
-
-        const byTotal = (v2.original_price || 0) - (v2.listing_price_without_gst || 0);
-        const byBase = (v2.original_base_listing_price || 0) - (v2.base_listing_price || 0);
-
-        const amount = Math.max(byTotal, byBase);
-        if (!(amount >= CONFIG.minPriceDrop)) return null;
-
-        return { amount, previous: v2.original_price || null };
-    }
-
-    // The ₹ is optional: the headline renders it as an inline <svg>, so its textContent has none.
-    function parsePrice(text) {
-        const m = String(text || '').match(/([\d.,]+)\s*(lakh|l|cr|crore)?\b/i);
-        if (!m) return null;
-
-        const n = parseFloat(m[1].replace(/,/g, ''));
-        if (!isFinite(n) || n <= 0) return null;
-
-        switch ((m[2] || '').toLowerCase()) {
-            case 'cr':
-            case 'crore':
-                return Math.round(n * 10000000);
-            case 'l':
-            case 'lakh':
-                return Math.round(n * 100000);
-            default:
-                return Math.round(n);
-        }
-    }
-
-    function shownPriceOf(card) {
-        const el = card.querySelector(SEL.price);
-        if (el) return parsePrice(el.textContent);
-
-        const money = [];
-        for (const n of card.querySelectorAll('span,div,p')) {
-            if (n.children.length) continue;
-            if (parsePrice(n.textContent)) money.push(n);
-        }
-
-        const asking = money.filter((n) => !struckThrough(n));
-        const pick = (asking.length ? asking : money).pop();
-        return pick ? parsePrice(pick.textContent) : null;
-    }
-
-    function struckThrough(el) {
-        try {
-            const style = window.getComputedStyle && window.getComputedStyle(el);
-            return !!style && /line-through/.test(style.textDecorationLine || style.textDecoration || '');
-        } catch {
-            return false;
-        }
-    }
-
-    /* -- the line under the card ------------------------------------------- */
-
-    function feeText(p) {
-        const inside = p.lines.filter((line) => line.where === 'inside');
-        const onTop = p.lines.filter((line) => line.where === 'onTop');
-
-        const itemise = (list) => list
-            .map((line) => line.label + ' ' + (line.included ? '(included)' : fmt.rupees(line.amount || 0)))
-            .join(', ');
-
-        const tip = [
-            'Car ' + fmt.rupees(p.base) + ' + ' + fmt.rupees(p.fees) + ' fees = ' +
-                fmt.rupees(p.allIn) + ' all-in.',
-            p.onTop > 0
-                ? 'The card shows ' + fmt.rupees(p.headline) + ', so ' + fmt.rupees(p.onTop) +
-                  ' is still owed on top' + (onTop.length ? ' - ' + itemise(onTop) : '') + '.'
-                : '',
-            inside.length ? 'Inside the shown price: ' + itemise(inside) + '.' : '',
-            p.discount > 0 ? 'Includes a ' + fmt.rupees(p.discount) + ' sale discount.' : '',
-        ].filter(Boolean).join('\n');
-
-        return {
-            main: fmt.lakh(p.allIn) + ' all-in',
-            mid: fmt.compact(p.fees) + ' fees',
-            tip,
-        };
-    }
-
-    function dropSuffix(p) {
-        if (!p.drop) return null;
-        return {
-            label: 'price cut ' + fmt.compact(p.drop.amount),
-            tip: 'Spinny has cut the asking price by ' + fmt.rupees(p.drop.amount) +
-                (p.drop.previous ? ', down from ' + fmt.rupees(p.drop.previous) : '') +
-                '. It cut the car\'s own base price, not the fees, and it shows this nowhere on the ' +
-                'site. Read it with how long the car has been listed: on Spinny the cars that get ' +
-                'marked down are overwhelmingly the ones that have been sitting.\n' +
-                'The date of the cut is not published, so none is claimed here.',
-        };
-    }
-
-    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-    function renderLine(card, text, suffix) {
-        const host = card.querySelector(SEL.detail);
-        if (!host) return false;
-
-        let node = host.querySelector('[' + LINE + ']');
-        if (!node) {
-            node = document.createElement('div');
-            node.setAttribute(LINE, '1');
-            node.style.cssText = [
-                'position:relative',
-                'z-index:3',
-                'display:flex',
-                'align-items:baseline',
-                'gap:6px',
-                'margin-top:8px',
-                'font-size:12px',
-                'line-height:16px',
-                'white-space:nowrap',
-                'overflow:hidden',
-                'cursor:default',
-            ].join(';');
-            host.appendChild(node);
-        }
-
-        const steps = [
-            [text.main, text.mid, suffix],
-            [text.main, text.mid, null],
-            [text.main, null, null],
-        ];
-        for (const [main, mid, suf] of steps) {
-            paint(node, main, mid, suf, text.tip + (suffix && suffix.tip ? '\n\n' + suffix.tip : ''));
-            if (node.scrollWidth <= node.clientWidth || !node.clientWidth) break;
-        }
-
-        card.setAttribute(MARK, '1');
-        return true;
-    }
-
-    function paint(node, main, mid, suffix, tip) {
-        node.innerHTML =
-            '<span style="font-weight:600;color:#2e054e">' + esc(main) + '</span>' +
-            (mid ? '<span style="color:#555">&middot; ' + esc(mid) + '</span>' : '') +
-            (suffix ? '<span style="color:#1b6b4a;font-weight:600">&middot; ' + esc(suffix.label) + '</span>' : '');
-        node.setAttribute('title', tip || '');
-    }
-
-    /* -- pills over the photo ---------------------------------------------- */
+    const PURPLE = '#2e054e';
+    const GREY = '#5b5b66';
 
     const TONE = {
-        good: { fg: '#1B6B4A', bg: 'rgba(232,248,240,0.94)' },
-        plain: { fg: '#3F4145', bg: 'rgba(255,255,255,0.94)' },
-        warn: { fg: '#A33A2B', bg: 'rgba(253,236,233,0.94)' },
+        // The neutral tone is the card's own badge: #f6f6f6 on #2e054e, fully round.
+        plain: { bg: '#f6f6f6', fg: PURPLE },
+        good: { bg: '#e7f6ee', fg: '#116343' },
+        warn: { bg: '#fdece9', fg: '#a33a2b' },
     };
 
-    // Priority order: earlier wins a slot when there is not room, and sets the top-to-bottom order.
-    const PILLS = ['age', 'km', 'owners', 'ready', 'saved'];
+    const css = (rules) => Object.keys(rules).map((k) => k + ':' + rules[k]).join(';');
 
-    function pillStack(card) {
-        const existing = card.querySelector('[' + PILL_STACK + ']');
-        if (existing) return existing;
-
-        const host = card.querySelector(SEL.body) || card;
-        const position = getComputedStyle(host).position;
-        if (!position || position === 'static') host.style.position = 'relative';
-
-        const stack = document.createElement('div');
-        stack.setAttribute(PILL_STACK, '1');
-        stack.style.cssText = [
-            'position:absolute',
-            'top:44px',
-            'right:12px',
-            'z-index:3',
-            'display:flex',
-            'flex-direction:column',
-            'align-items:flex-end',
-            'gap:3px',
-            'pointer-events:none',
-        ].join(';');
-        host.appendChild(stack);
-        return stack;
+    function priceParts(p) {
+        const parts = [
+            { text: fmt.lakh(p.allIn) + ' all-in', color: PURPLE, weight: 600 },
+            { text: fmt.compact(p.fees) + ' fees', color: GREY, weight: 400 },
+        ];
+        if (p.onTop > 0) {
+            parts.push({ text: fmt.compact(p.onTop) + ' on top', color: TONE.warn.fg, weight: 600 });
+        }
+        return parts;
     }
 
-    function addPill(card, name, spec) {
-        if (!spec) return;
+    function priceTip(p) {
+        const itemise = (where) => p.lines
+            .filter((l) => l.where === where)
+            .map((l) => l.label + ' ' + (l.amount === null ? '(included)' : fmt.rupees(l.amount)))
+            .join(', ');
 
-        const marker = 'data-spce-' + name;
-        if (card.querySelector('[' + marker + ']')) return;
+        const inside = itemise('in');
+        const onTop = itemise('on');
 
-        const stack = pillStack(card);
-        const rank = PILLS.indexOf(name);
-
-        // Cheap pills arrive first, so making room means evicting a placed pill, not refusing this one.
-        if (stack.children.length >= CONFIG.maxPills) {
-            const worst = Array.from(stack.children)
-                .reduce((w, el) => (Number(el.dataset.rank) > Number(w.dataset.rank) ? el : w));
-            if (Number(worst.dataset.rank) <= rank) return;
-            worst.remove();
-        }
-
-        const pill = document.createElement('div');
-        pill.setAttribute(marker, '1');
-        pill.dataset.rank = String(rank);
-        pill.style.cssText = [
-            'order:' + (rank + 1),
-            'padding:1px 5px',
-            'border-radius:6px',
-            'background:' + spec.tone.bg,
-            'color:' + spec.tone.fg,
-            'font-size:10px',
-            'line-height:12px',
-            'font-weight:600',
-            'text-align:right',
-            'white-space:nowrap',
-            'box-shadow:0 1px 3px rgba(0,0,0,0.12)',
-        ].join(';');
-        pill.innerHTML =
-            '<span>' + esc(spec.value) + '</span>' +
-            (spec.unit ? '<span style="font-weight:400;opacity:0.75">' + esc(spec.unit) + '</span>' : '');
-
-        if (spec.tip) {
-            pill.setAttribute('title', spec.tip);
-            pill.style.pointerEvents = 'auto';
-        }
-
-        stack.appendChild(pill);
+        return [
+            'Car ' + fmt.rupees(p.base) + ' + ' + fmt.rupees(p.fees) + ' in fees = ' +
+                fmt.rupees(p.allIn) + ' all-in.',
+            p.onTop > 0
+                ? 'The card shows ' + fmt.rupees(p.shown) + ', so ' + fmt.rupees(p.onTop) +
+                  ' is still owed on top' + (onTop ? ' — ' + onTop : '') + '.'
+                : '',
+            inside ? 'Already inside the price shown: ' + inside + '.' : '',
+            p.sale > 0 ? 'Includes a ' + fmt.rupees(p.sale) + ' sale discount.' : '',
+            'All of it is mandatory. Same numbers as Spinny\'s own price popup.',
+        ].filter(Boolean).join('\n');
     }
 
-    function kmSpec(car) {
-        const km = car.mileage;
-        const year = car.registration_year || car.make_year;
-        if (!km || !year) return null;
+    // 58,000 km means very different things on a 2013 car and a 2021 one.
+    function kmChip(car) {
+        if (!(car.km > 0) || !(car.year > 0)) return null;
 
-        const years = Math.max(1, new Date().getFullYear() - year);
-        const perYear = Math.round(km / years);
-        if (!isFinite(perYear) || perYear <= 0) return null;
+        const years = Math.max(1, new Date().getFullYear() - car.year);
+        const perYear = Math.round(car.km / years);
+        if (!(perYear > 0)) return null;
 
         const ratio = perYear / CONFIG.avgKmPerYear;
-        let tone = TONE.plain;
-        if (ratio <= 0.75) tone = TONE.good;
-        else if (ratio >= 1.4) tone = TONE.warn;
-
         return {
-            value: fmt.grouped(perYear),
-            unit: ' km/yr',
-            tone,
-            tip: fmt.grouped(km) + ' km over ' + years + ' years since registration',
+            text: fmt.km(perYear) + ' km/yr',
+            tone: ratio <= 0.75 ? TONE.good : ratio >= 1.4 ? TONE.warn : TONE.plain,
+            tip: fmt.grouped(car.km) + ' km over ' + years + (years === 1 ? ' year' : ' years') +
+                ' since registration. About ' + fmt.grouped(CONFIG.avgKmPerYear) + ' km/yr is average.',
         };
     }
 
-    function ageSpec(days) {
+    function ageChip(days) {
         if (days === null || days < 0) return null;
 
         const stale = days > CONFIG.staleDays;
-        let tone = TONE.plain;
-        if (days < CONFIG.freshDays) tone = TONE.good;
-        else if (stale) tone = TONE.warn;
-
         return {
-            value: days === 0 ? 'listed today' : 'listed ' + days + 'd',
-            tone,
+            text: days === 0 ? 'listed today' : 'listed ' + days + 'd',
+            tone: days < CONFIG.freshDays ? TONE.good : stale ? TONE.warn : TONE.plain,
             tip: (days === 0
                 ? 'First listed on Spinny today'
                 : 'First listed on Spinny ' + days + (days === 1 ? ' day' : ' days') + ' ago') +
-                (stale ? ' - it has been sitting a while, so there may be room to negotiate' : ''),
+                (stale ? '. It has been sitting a while, so there may be room to negotiate.' : '.'),
         };
     }
 
-    function savedSpec(saved) {
-        if (typeof saved !== 'number' || saved <= 0) return null;
+    function cutChip(p) {
+        if (!(p.cut > 0)) return null;
         return {
-            value: fmt.grouped(saved),
-            unit: ' saved',
+            text: 'price cut ' + fmt.compact(p.cut),
+            tone: TONE.good,
+            tip: 'Spinny has cut this car\'s base price by ' + fmt.rupees(p.cut) + ' and shows ' +
+                'that nowhere. Read it against how long the car has been listed. No date for ' +
+                'the cut is published, so none is claimed here.',
+        };
+    }
+
+    // Never displayed on the card, though it moves resale value more than most of what is.
+    function ownersChip(car) {
+        if (!(car.owners > 1)) return null;
+        return {
+            text: fmt.ordinal(car.owners) + ' owner',
+            tone: car.owners >= 3 ? TONE.warn : TONE.plain,
+            tip: 'This car has had ' + car.owners + ' registered owners.',
+        };
+    }
+
+    // Cars still in refurbishment get a wordless badge: you are told it isn't ready, never when.
+    function readyChip(car) {
+        if (!car.readyOn) return null;
+
+        const days = daysUntil(car.readyOn);
+        if (days === null) return null;
+
+        return {
+            text: 'ready ' + fmt.day(car.readyOn),
             tone: TONE.plain,
-            tip: fmt.grouped(saved) + (saved === 1 ? ' person has' : ' people have') +
-                ' shortlisted this car. This tracks how long the car has been listed more than it ' +
-                'tracks demand, so read it against the days-listed pill rather than on its own.',
+            tip: 'Still in refurbishment — available from ' + fmt.day(car.readyOn) +
+                (days > 0 ? ', about ' + days + (days === 1 ? ' day' : ' days') + ' away' : '') + '.',
         };
     }
 
-    function ownersSpec(car) {
-        const n = car.no_of_owners;
-        if (typeof n !== 'number' || n <= 1) return null;
-        return {
-            value: fmt.ordinal(n) + ' owner',
-            tone: n >= 3 ? TONE.warn : TONE.plain,
-            tip: 'This car has had ' + n + ' registered owners',
-        };
+    /* -- drawing ----------------------------------------------------------- */
+
+    function render(host, car, days) {
+        let block = host.querySelector('[' + BLOCK + ']');
+        if (!block) {
+            block = document.createElement('div');
+            block.setAttribute(BLOCK, '1');
+            // A transparent click overlay covers the whole card at z-index 2 and swallows every
+            // hover, so the block is lifted above it. The cost is that this strip does not open
+            // the car - the right trade for being able to read the breakdown.
+            block.style.cssText = css({
+                position: 'relative',
+                'z-index': 3,
+                'margin-top': '8px',
+                'font-family': 'SpinnyJost, inherit',
+                cursor: 'default',
+            });
+            host.appendChild(block);
+        }
+
+        block.textContent = '';
+        block.appendChild(priceRow(car.p));
+
+        const chips = chipRow(car, days);
+        if (chips) block.appendChild(chips);
     }
 
-    function readySpec(readyOn) {
-        if (!readyOn) return null;
+    function priceRow(p) {
+        const row = document.createElement('div');
+        row.style.cssText = css({
+            display: 'flex',
+            'flex-wrap': 'wrap',
+            'align-items': 'baseline',
+            'column-gap': '5px',
+            'font-size': '13px',
+            'line-height': '18px',
+        });
+        row.title = priceTip(p);
 
-        const days = daysUntil(readyOn);
-        if (days === null || days < 0) return null;
+        priceParts(p).forEach((part, i) => {
+            // The separator travels with the text it introduces, inside a nowrap wrapper. As a
+            // flex item of its own it gets left dangling at the end of a wrapped line, which is
+            // what the 199px column in the similar-cars strip does to all three parts.
+            const cell = document.createElement('span');
+            cell.style.cssText = css({ 'white-space': 'nowrap' });
 
-        return {
-            value: 'ready ' + fmt.day(readyOn),
-            tone: TONE.plain,
-            tip: 'Still in refurbishment - available from ' + fmt.day(readyOn) +
-                (days <= 0 ? '' : ', about ' + days + (days === 1 ? ' day' : ' days') + ' away'),
-        };
+            if (i) {
+                const sep = document.createElement('span');
+                sep.textContent = '· ';
+                sep.style.cssText = css({ color: '#b9b9c2' });
+                cell.appendChild(sep);
+            }
+
+            const text = document.createElement('span');
+            text.textContent = part.text;
+            text.style.cssText = css({ color: part.color, 'font-weight': part.weight });
+            cell.appendChild(text);
+
+            row.appendChild(cell);
+        });
+
+        return row;
+    }
+
+    function chipRow(car, days) {
+        // Explicit order: each fact arrives whenever its request finishes, and by insertion the
+        // chips would shuffle between loads.
+        const chips = [kmChip(car), ageChip(days), cutChip(car.p), ownersChip(car), readyChip(car)]
+            .filter(Boolean);
+        if (!chips.length) return null;
+
+        const row = document.createElement('div');
+        row.style.cssText = css({
+            display: 'flex',
+            'flex-wrap': 'wrap',
+            gap: '4px',
+            'margin-top': '6px',
+        });
+
+        for (const spec of chips) {
+            const el = document.createElement('span');
+            el.textContent = spec.text;
+            el.title = spec.tip || '';
+            el.style.cssText = css({
+                display: 'inline-flex',
+                'align-items': 'center',
+                height: '20px',
+                padding: '0 8px',
+                'border-radius': '1000px',
+                background: spec.tone.bg,
+                color: spec.tone.fg,
+                'font-size': '12px',
+                'line-height': '16px',
+                'font-weight': 500,
+                'white-space': 'nowrap',
+            });
+            row.appendChild(el);
+        }
+
+        return row;
     }
 
     /* -- per card ---------------------------------------------------------- */
 
+    // The heart carries the car's id outright, which is the shortest path to it. The link is
+    // the fallback: its last path segment is the same number.
     function idOf(card) {
         const heart = card.querySelector(SEL.heart);
-        if (heart && heart.dataset && /^\d{5,}$/.test(heart.dataset.label || '')) return heart.dataset.label;
+        const label = heart && heart.getAttribute('data-label');
+        if (label && /^\d{5,}$/.test(label)) return label;
 
         const link = card.querySelector(SEL.link);
         const href = link ? link.getAttribute('href') || '' : '';
@@ -884,109 +730,122 @@
         return m ? m[1] : null;
     }
 
-    const enriched = new WeakSet();
-    const toppedUp = new WeakSet();
+    function hostOf(card) {
+        // The grid card names its detail box outright.
+        const named = card.querySelector(SEL.detail);
+        if (named) return named;
 
-    function carFor(card) {
-        return tap.get(idOf(card)) || fiber.get(card.closest(SEL.cell) || card);
+        // The strip card has no such box - its details are a column beside the photo - and if
+        // that id is ever renamed the grid card won't either. The column holding the title is
+        // the answer in both cases. It is only 199px wide in the strip, which is why the price
+        // line and the chips are both allowed to wrap rather than being truncated.
+        const title = card.querySelector(SEL.title);
+        if (!title) return null;
+        return title.closest('div[class*="ds-flex-col"]') || title.closest('div[class*="ds-px"]');
     }
 
-    const skip = (car) => car.sold || car.booked || car.soft_unpublish;
+    const known = new WeakMap();   // card -> the distilled record
+    const daysOf = new WeakMap();  // card -> days listed
+    const asked = new WeakSet();
+    const agedAsked = new WeakSet();
+    const broken = new WeakSet();
 
-    const carRequested = new Set();
+    function draw(card) {
+        const car = known.get(card);
+        if (!car || car.dead) return;
 
-    // Third data source, and the one that makes the script independent of timing. If neither
-    // the tap nor React's fiber can produce the car, ask for it by id: the batched top-up
-    // folds everything it fetches back into the tap, so the next sweep enriches the card the
-    // ordinary way. The tap only sees requests made after it is installed, and a userscript
-    // manager cannot always guarantee that it wins that race - without this, losing the race
-    // once means the page is never enriched at all.
-    function requestCar(id) {
-        if (!id || carRequested.has(id)) return;
-        carRequested.add(id);
-        topUp.get(id).catch(() => {});
+        const host = hostOf(card);
+        if (host) render(host, car, daysOf.has(card) ? daysOf.get(card) : null);
     }
 
-    // Everything here is already in the tapped payload, so it costs no request and runs as
-    // soon as the card exists rather than waiting for the card to be looked at. Returns
-    // whether the car was resolved, so the caller can go and fetch it if it was not.
-    function enrichCard(card) {
-        const id = idOf(card);
-        if (!id) return true;  // Not a card we can key; nothing to fetch either.
-
-        const car = carFor(card);
-        if (!car) return false;
-        enriched.add(card);
-        if (skip(car)) return true;
-
-        addPill(card, 'km', kmSpec(car));
-        addPill(card, 'owners', ownersSpec(car));
-
-        const p = priceOf(car, shownPriceOf(card));
-        if (!p) {
-            LOG(id, car.make, car.model, '-> price not decomposable, leaving the card alone');
-            return true;
-        }
-
-        renderLine(card, feeText(p), dropSuffix(p));
-        return true;
-    }
-
-    // These two cost a request each, so they wait until the card is near the viewport.
-    function topUpCard(card) {
+    function sweepCard(card) {
         const id = idOf(card);
         if (!id) return;
 
-        const car = carFor(card);
-        if (!car) return;
-        toppedUp.add(card);
-        if (skip(car)) return;
+        if (!known.has(card)) {
+            if (!asked.has(card)) {
+                asked.add(card);
+                carData.get(id).then((car) => {
+                    if (!car) return;
+                    known.set(card, car);
+                    draw(card);
+                }).catch(() => {});
+            }
+            return;
+        }
 
-        listingAgeOf(id).then((days) => addPill(card, 'age', ageSpec(days))).catch(() => {});
+        // React replaces card subtrees on scroll and pagination, so a block that was drawn can
+        // vanish. Redrawing it from the record already in hand costs no request.
+        const host = hostOf(card);
+        if (host && !host.querySelector('[' + BLOCK + ']')) draw(card);
 
-        topUp.get(id).then((extras) => {
-            if (!extras) return;
-            addPill(card, 'saved', savedSpec(extras.saved));
-            addPill(card, 'ready', readySpec(extras.readyOn));
-        }).catch(() => {});
+        // The one enrichment that costs a request of its own, so it waits twice over: for the
+        // card to be worth one, and for the record above to have landed. That second wait is
+        // what keeps four concurrent 200 KB fetches from starving the 18 KB batch that every
+        // card's price line depends on - without it the whole grid prices late.
+        const car = known.get(card);
+        if (CONFIG.showDaysListed && !car.dead && !agedAsked.has(card) && nearViewport(card)) {
+            agedAsked.add(card);
+            daysListedOf(id).then((days) => {
+                if (days === null) return;
+                daysOf.set(card, days);
+                draw(card);
+            }).catch(() => {});
+        }
     }
 
     /* -- discovery --------------------------------------------------------- */
 
-    // An IntersectionObserver is the wrong primitive for this grid. Spinny mounts cards
-    // lazily - on a filtered page they can appear twenty seconds in, at zero height - and
-    // the observer's first callback then reports every one of them as not intersecting.
-    // Nothing calls it again, so the whole page stays unenriched. A plain sweep over the
-    // cards that exist right now, re-run on anything that could have changed them, cannot
-    // get wedged that way.
-    const nearViewport = (card) => {
+    // An IntersectionObserver is the wrong primitive for this grid. Spinny mounts cards lazily -
+    // on a filtered page they can appear twenty seconds in, at zero height - and the observer's
+    // first callback then reports every one of them as not intersecting. Nothing calls it again,
+    // so the page stays bare. A plain sweep over the cards that exist right now, re-run on
+    // anything that could have changed them, cannot get wedged that way.
+    function nearViewport(card) {
         const r = card.getBoundingClientRect();
         if (!r.width && !r.height) return false;
         const margin = CONFIG.viewportMargin;
         return r.bottom > -margin && r.top < (window.innerHeight || 0) + margin;
-    };
+    }
 
-    // Each card is isolated. One card that throws - an unfamiliar payload, a node React is
-    // midway through replacing - must never take the rest of the page with it, and must not
-    // be retried forever either, or every sweep dies at the same card.
-    function sweepCard(card) {
-        try {
-            if (!enriched.has(card) && !enrichCard(card)) requestCar(idOf(card));
-            if (!toppedUp.has(card) && nearViewport(card)) topUpCard(card);
-        } catch (e) {
-            enriched.add(card);
-            toppedUp.add(card);
-            LOG('card threw, skipping it', e);
-        }
+    function cardNodes() {
+        const out = new Set();
+
+        const take = (node) => {
+            const card = node.closest(SEL.card);
+            // data-id-componentname also marks page-level containers - the listing grid itself
+            // carries one - so anything holding more than one heart is a grid, not a car.
+            if (card && card.querySelectorAll(SEL.heart).length <= 1) out.add(card);
+        };
+
+        for (const heart of document.querySelectorAll(SEL.heart)) take(heart);
+        // The detail box is the thing actually needed, and not every layout is guaranteed to
+        // carry the heart, so it gets a look-in of its own.
+        for (const detail of document.querySelectorAll(SEL.detail)) take(detail);
+
+        return out;
     }
 
     function scan() {
         if (document.hidden) return;
-        document.querySelectorAll(SEL.card).forEach(sweepCard);
+
+        for (const card of cardNodes()) {
+            // One unfamiliar card - a payload in a shape not seen, a node React is midway
+            // through replacing - must never take the rest of the page with it, and must not be
+            // retried forever either, or every sweep dies at the same card.
+            if (broken.has(card)) continue;
+            try {
+                sweepCard(card);
+            } catch (e) {
+                broken.add(card);
+                LOG('card threw, skipping it', e);
+            }
+        }
     }
 
     let scanTimer = null;
     let scanAskedAt = 0;
+
     function scanSoon() {
         const now = Date.now();
         if (!scanAskedAt) scanAskedAt = now;
@@ -1003,10 +862,11 @@
         scanTimer = setTimeout(run, CONFIG.scanDebounceMs);
     }
 
+    // Our own block also mutates the page, so ignore records that only touch it.
     function onMutation(records) {
         for (const r of records) {
             const t = r.target;
-            if (t && t.closest && t.closest('[' + PILL_STACK + '],[' + LINE + ']')) continue;
+            if (t && t.closest && t.closest('[' + BLOCK + ']')) continue;
             scanSoon();
             return;
         }
@@ -1014,33 +874,24 @@
 
     // Order matters: every trigger is registered before the first sweep runs. Sweeping first
     // would mean a throw in that sweep silently costs us the observer, the listeners and the
-    // backstop timer - one bad card at load, and the script is dead for the whole session.
+    // backstop timer - one bad card at load and the script is dead for the session.
     function start() {
-        try { store.drop(true); } catch (_) {}
+        try { store.drop(true); } catch (e) {}
 
         new MutationObserver(onMutation).observe(document.body, { childList: true, subtree: true });
 
-        // Scrolling is what brings a card into range, so it drives the sweep directly
-        // rather than being inferred from a mutation.
+        // Scrolling is what brings a card into range, so it drives the sweep directly rather
+        // than being inferred from a mutation.
         window.addEventListener('scroll', scanSoon, { passive: true });
         window.addEventListener('resize', scanSoon, { passive: true });
         window.addEventListener('popstate', scanSoon);
         document.addEventListener('visibilitychange', scanSoon);
 
-        // The events above cover everything observed, but they are still a model of how
-        // Spinny behaves, and this page has already broken one such model. The sweep is a
-        // WeakSet check per card, so running it unconditionally costs nothing and removes
-        // the need for the model to be complete.
+        // The events above cover everything observed, but they are still a model of how Spinny
+        // behaves, and this page has already broken one such model. A sweep is a WeakSet lookup
+        // per card, so running it unconditionally costs nothing and removes the need for the
+        // model to be complete.
         setInterval(scan, CONFIG.sweepMs);
-
-        for (const m of ['pushState', 'replaceState']) {
-            const orig = history[m];
-            history[m] = function (...args) {
-                const r = orig.apply(this, args);
-                scanSoon();
-                return r;
-            };
-        }
 
         scan();
     }
@@ -1051,35 +902,42 @@
         start();
     }
 
-    // Support hook. This script has now failed twice for reasons invisible from the outside -
-    // a wedged observer, then a suspected lost race for the network tap - and both times the
+    /* -- support hook ------------------------------------------------------ */
+
+    // This script has failed twice for reasons invisible from the outside, and both times the
     // only way to tell "not running" from "running but finding nothing" was to guess. Run
     // spinnyEnricher.status() in the console and it says which.
-    window.spinnyEnricher = {
-        version: '1.2.1',
+    const api = {
+        version: '2.0.0',
         status() {
-            const cards = document.querySelectorAll(SEL.card);
-            const withLine = document.querySelectorAll('[' + LINE + ']').length;
+            const cards = Array.from(cardNodes());
             return {
                 running: true,
                 cardsOnPage: cards.length,
-                cardsWithPriceLine: withLine,
-                carsFromTap: tap.cars.size,
-                tapInstalled: !!XMLHttpRequest.prototype[MARK] && !!window.fetch[MARK],
-                promoCssInjected: !!document.getElementById('spce-css'),
-                idOfFirstCard: cards[0] ? idOf(cards[0]) : null,
-                firstCardHasData: cards[0] ? !!carFor(cards[0]) : null,
+                cardsDrawn: document.querySelectorAll('[' + BLOCK + ']').length,
+                cardsWithRecord: cards.filter((c) => known.has(c)).length,
+                firstCardId: cards[0] ? idOf(cards[0]) : null,
+                firstCardHasHost: cards[0] ? !!hostOf(cards[0]) : null,
+                cached: (() => {
+                    try {
+                        return Object.keys(localStorage).filter((k) => k.indexOf(store.PREFIX) === 0).length;
+                    } catch (e) { return null; }
+                })(),
                 pageHidden: document.hidden,
             };
         },
         rescan: scan,
+        clearCache() { store.drop(false); return 'cache cleared'; },
         CONFIG,
     };
 
+    try { (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).spinnyEnricher = api; }
+    catch (e) { window.spinnyEnricher = api; }
+
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
-            fmt, parsePrice, parseIst, daysSince, daysUntil, priceOf, priceDropOf, modelsOf, decompose,
-            feeText, dropSuffix, kmSpec, ageSpec, savedSpec, ownersSpec, readySpec, CONFIG,
+            fmt, parseIst, daysSince, daysUntil, priceOf, cutOf, saleOf, distil,
+            kmChip, ageChip, cutChip, ownersChip, readyChip, priceTip, priceParts, CONFIG,
         };
     }
 })();

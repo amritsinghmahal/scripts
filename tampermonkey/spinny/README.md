@@ -1,20 +1,13 @@
 # Spinny Card Enricher
 
-A userscript that fixes two things about every car card on [spinny.com](https://www.spinny.com):
+A userscript that adds five facts to every car card on [spinny.com](https://www.spinny.com):
 
-**It removes two adverts.**
-
-1. The pink discount pill over the top-left of the photo — `₹20,000 ↓`.
-2. The `Save extra ₹26.6K on` banner wrapped around the EMI figure.
-
-**And it adds five facts.**
-
-3. **What the car actually costs all-in** — and how much of that is fees rather than car.
-4. **Whether the price has already been cut**, and by how much.
-5. **How hard the car has been driven** — kilometres per year, not just total odometer.
-6. **How long it has been listed** — from the field Spinny's own "Newest First" sort runs on.
-7. **How many people have shortlisted it**, plus **how many owners it has had** and **when it will be
-   ready** if it is still in refurbishment.
+1. **What the car actually costs all-in** — and how much of that is fees rather than car.
+2. **How much is still owed on top** of the price printed on the card.
+3. **How hard it has been driven** — kilometres per year, not just total odometer.
+4. **How long it has been listed** — from the field Spinny's own "Newest First" sort runs on.
+5. **Whether the price has been cut**, how many owners it has had, and when it will be ready if
+   it is still in refurbishment.
 
 ![what it looks like](docs/preview.png)
 
@@ -22,86 +15,58 @@ A userscript that fixes two things about every car card on [spinny.com](https://
 
 ## Why bother?
 
-Spinny quotes you **₹3.64 Lakh** for a 2016 Celerio. You will pay **₹3,74,345**.
+Spinny quotes you **₹7.06 Lakh** for a 2018 Swift. You will pay **₹7,17,885**.
 
-Nothing on the card says so. The gap is ₹10,277 — RC transfer facilitation ₹4,000, insurance ₹2,932,
-GST ₹3,345 — all of it mandatory, none of it optional. And of the ₹3.64 Lakh you *were* quoted, only
-₹3,44,783 is the car; the rest is a servicing bundle and a warranty.
-
-So the real split is:
+Nothing on the card says so. The card is printing the *third* of five figures Spinny computes:
 
 ```
-car                ₹3,44,783
-fees inside        ₹19,285     servicing, FASTag, fuel, warranty
-fees on top        ₹10,277     RC transfer, insurance, GST
-                   ─────────
-you pay            ₹3,74,345
-card says          ₹3,64,068
+base_listing_price                    ₹6,83,294    the car
++ base_add_on_data_list                 ₹22,285    servicing, warranty, FASTag, fuel
+= listing_price_without_tax           ₹7,05,579    ← WHAT THE CARD SHOWS
++ mandatory_paid_add_ons_data_list       ₹8,421    RC transfer, insurance
++ tax_add_on_data_list                       ₹0    TCS, and a transfer_tax in Gujarat
+= listing_price_without_gst           ₹7,14,000
++ gst                                    ₹3,885    GST on the whole lot
+= listing_price                       ₹7,17,885    ← WHAT YOU ACTUALLY PAY
 ```
+
+So the card understates the price by ₹12,306, and of the ₹7.06 Lakh it *does* quote, ₹22,285 is a
+servicing bundle and a warranty rather than the car.
 
 The script does that arithmetic on every card:
 
 ```
-before      ₹3.76 Lakh   ₹3.64 Lakh
-            VXi CNG                      EMI ₹ 6,602
+before      2018 Maruti Swift                      7.06 Lakh
+            ZDi Plus AMT                    EMI ₹ 12,159/m*
+            (57K km) (Diesel) (Automatic) (MH14)
 
-after       ₹3.76 Lakh   ₹3.64 Lakh
-            VXi CNG                      EMI ₹ 6,602
-            ₹3.74L all-in · ₹29.6k fees
+after       2018 Maruti Swift                      7.06 Lakh
+            ZDi Plus AMT                    EMI ₹ 12,159/m*
+            (57K km) (Diesel) (Automatic) (MH14)
+            ₹7.18L all-in · ₹34.6k fees · ₹12.3k on top
+            (7.1K km/yr) (listed 1d)
 ```
 
-Hover it for the itemised version:
+Hover the price line for the itemised version:
 
-> Car ₹3,44,783 + ₹29,562 fees = ₹3,74,345 all-in.
-> The card shows ₹3,64,068, so ₹10,277 is still owed on top — RC transfer facilitation ₹4,000,
-> Insurance ₹2,932, GST (govt. taxes) ₹3,345.
-> Inside the shown price: Servicing, FASTag, fuel & more ₹8,700, Warranty (Protect) ₹10,585,
-> Fixes & upgrades (included).
+> Car ₹6,83,294 + ₹34,591 in fees = ₹7,17,885 all-in.
+> The card shows ₹7,05,579, so ₹12,306 is still owed on top — RC transfer facilitation ₹4,000,
+> Insurance ₹4,421, GST (govt. taxes) ₹3,885.
+> Already inside the price shown: Servicing, FASTag, fuel & more ₹11,700, Warranty (Protect)
+> ₹10,585, Fixes & upgrades (included).
+> All of it is mandatory. Same numbers as Spinny's own price popup.
 
-Same numbers Spinny's own price popup shows. You just don't have to open it on every car.
-
-This is not one unlucky listing. Across **5,086 cars in 21 cities**, every single one had fees baked
-into the headline *and* more money owed on top of it:
+This is not one unlucky listing. Across **420 cars in 7 cities**, every single one had fees baked
+into the headline *and* more money owed on top of it — 420 of 420, both:
 
 | | min | p25 | median | p75 | max |
 |---|---|---|---|---|---|
-| fees, total | ₹10,510 | ₹24,725 | **₹28,973** | ₹35,642 | ₹1,04,842 |
-| of which owed on top of the price shown | ₹4,810 | ₹7,705 | **₹10,837** | ₹13,398 | ₹75,262 |
-| fees as % of the price shown | 1% | 4% | **5%** | 7% | 20% |
+| fees, total | ₹18,592 | ₹24,107 | **₹28,541** | ₹34,591 | ₹67,042 |
+| of which owed on top of the price shown | ₹6,119 | ₹7,402 | **₹10,360** | ₹12,567 | ₹37,298 |
+| fees as % of the price shown | 2% | 3% | **5%** | 6% | 13% |
 
 Spinny does admit this on a car's own page, where the price carries a small
 `+On-road charges & taxes`. On the listing grid it says nothing at all.
-
----
-
-## The two things it removes
-
-### The discount pill
-
-`span.CarListingCardV2__specialOfferBadgeWrapper` — a pink pill absolutely positioned to straddle the
-top edge of the card, showing the current sale discount. It is driven by `discount_v3.value` and it is
-the same number as the gap between the struck-through price and the headline, so it is the third time
-one fact is stated on one card.
-
-It is hidden in CSS, not deleted. React re-renders these cards on scroll, hover and pagination, so a
-removed node comes straight back.
-
-### The "Save extra" banner
-
-`span.LoanDiscountSavings__savingsWithLoanCampaign`. This one needs care, because it is **not** an
-overlay — it is the first flex child of the `<li>` that also contains the EMI figure. Hide the `<li>`
-and you lose the EMI.
-
-So the script hides only the banner, and then clears the pink gradient border, the left-rounded corner
-and the promo text colour that Spinny paints onto the EMI row to match it. Otherwise you get a pink
-box with nothing in it.
-
-Worth knowing what the number was: `finance.best.details.savings`, the interest you would save over
-the loan term at Spinny's campaign rate versus their standard one. It is not money off the car, and it
-only exists if you finance through them.
-
-The struck-through pre-sale price is left alone, since you asked for the pill and the banner. If you
-want it gone too, set `hideSlashedPrice: true` at the top of the script.
 
 ---
 
@@ -109,171 +74,181 @@ want it gone too, set `hideSlashedPrice: true` at the top of the script.
 
 ### 1. The all-in price and the fee split
 
-On **every** card, computed from the same itemised breakdown the site's own price popup reads.
+On **every** card, from the same itemised breakdown the site's own price popup reads.
 
-Spinny ships two breakdowns — `price_breakdown_v2` and `price_breakdown_v3` — and they use the same
-field names for different quantities. v3 splits RC transfer and insurance into their own list; v2
-folds both into the servicing bundle. Each pairs with its own discount object, and the two disagree on
-exactly one field, by exactly that RC-and-insurance total. Pair them across versions and the headline
-moves silently.
+Spinny ships two breakdowns, `price_breakdown_v2` and `price_breakdown_v3`, and they use the same
+field names for different quantities: v2 folds RC transfer and insurance into the servicing bundle,
+v3 gives them their own list. They agree on the payable total and disagree on everything between,
+so **only v3 can say what the card is printing**. Where v3 is missing the script prices the car but
+claims no on-top figure, which is the failure mode you want.
 
-Which one a card renders depends on `procurement_category`: luxury cars get v2, everything else v3.
-Rather than test the category, the script computes both and keeps whichever reproduces the price
-actually printed on the card. That is also how it decides which fees are inside the headline and which
-are on top, because Spinny has shipped the price both ways and gates the choice on a per-user
-experiment flag. Measure, don't assume.
+Both identities above — `base + inside = listing_price_without_tax` and
+`base + inside + mandatory + tax + gst = listing_price` — hold on **420 of 420** cars sampled
+across Pune, Delhi, Bangalore, Mumbai, Hyderabad, Ahmedabad and Chennai. The stated totals are
+therefore treated as authoritative and the line items are only used to itemise the tooltip.
 
-If no candidate matches the card, the script prints nothing. That is the failure mode you want.
+Fee line names are **not** fixed nationally: alongside TCS there is a `transfer_tax` in Gujarat.
+They are summed rather than named for that reason.
 
-### 2. Price cut
+### 2. km per year
 
-`price cut ₹70.0k` when Spinny has marked the car down.
-
-This is the one thing here that Cars24 structurally cannot offer. `price_breakdown_v2` keeps the
-previous price alongside the current one — Spinny's own labels for the three lines are `Subtotal`,
-`Price drop` and `Final payable amount` — and it moved the *base* price, not the fees, so it is a
-genuine markdown rather than a coupon. It is referenced by none of the 39 scripts the site loads: they
-carry the number and never show it.
-
-Fires on **35%** of a city's cards, at a ₹10,000 floor. Median cut ₹44,478; the largest found was
-₹6,46,520 off a 2021 Skoda Superb.
-
-Read it next to days-listed. The cut is mostly a function of how long the car has been sitting —
-across cars whose true listing date was measured, 15 of 17 listed under 30 days had no cut, and 19 of
-21 listed over 30 days did. Because the default sort is newest-first, you will see no cuts at all on
-the first screenful and plenty by the last.
-
-**No date is claimed.** `current_price_data.created_on` dates the last repricing, not the cut, and its
-distribution is identical on cars that were cut and cars that never were — median 5.4 days against
-5.5, even on a car that has been listed 522 days. So it cannot carry the claim and isn't used.
-
-### 3. km per year
-
-`58,032 km` means very different things on a 2013 car and a 2021 one. The pill divides by the car's age:
+`58,032 km` means very different things on a 2013 car and a 2021 one, so the chip divides by age:
 
 - **green** — under ~9,000 km/yr, an easy life
 - **grey** — normal, around the 12,000 km/yr mark
 - **red** — over ~17,000 km/yr, this one has worked
 
 It divides by `registration_year`, not `make_year`, for two reasons: the odometer starts running at
-registration, and registration year is what the card itself prints at the top. The two disagree on
-about one car in eleven, always by a single year, and always on young cars where the denominator is
-small enough to matter — up to a 5,769 km/yr swing, which is the difference between "gentle" and
-"hard-used" on a 2023 car.
+registration, and registration year is what the card itself prints at the top.
 
-### 4. Days listed
+### 3. Days listed
 
-`listed today` / `listed 32d` / `listed 107d`, coloured green under 14 days and amber over 60.
+`listed today` / `listed 32d` / `listed 107d`, green under 14 days and amber over 60.
 
-The field is `added_on`, and earning the right to print it took some work.
+The field is `added_on`, and it is the one thing here that costs a request. It is on **none** of the
+batched endpoints — listing `v3`, `v4`, `v5`, `v6`, `v7` and `light/v5` all omit it, and none of them
+honour a `fields=` filter — so it comes from the per-car page-data route, about 200 KB. A first
+listing date cannot change, so it is cached for a month and the day count recomputed locally, and it
+is only fetched for cards you actually scroll to. Set `showDaysListed: false` if you would rather
+not pay for it at all; everything else then costs one request per 40 cards.
 
-The obvious candidate is `latest_publish_date`, which is on every listing payload for free. It is
-wrong. It is a *republish* timestamp, and it fails bimodally: on most cars it lands within ten seconds
-of the true date, so a spot-check looks perfect — and then a car that has been on Spinny for 232 days
-reports 38. One car in a whole city's inventory had been listed 522 days; `latest_publish_date` capped
-out at 38 across the entire city.
-
-`added_on` is the real thing, and the proof is the same one the Cars24 script uses for its own
-equivalent: Spinny's "Newest First" sort option is literally `o=-added_on`, and the order that sort
-returns is strictly monotonically decreasing in `added_on` across every card, zero violations — while
-`latest_publish_date` breaks the order in seven places. Spinny's own analytics code calls the field
-`listingDate` and derives a `tat` ("turnaround time") from it.
-
-It is not on any of the batched endpoints, only on a car's own page-data route, so **this is the one
-request the script makes per card** — about 27 KB gzipped, and a first-listing date cannot change, so
-it is cached for a month and the day count recomputed locally. Set `showAge: false` if you would
-rather not pay for it.
+**Do not substitute `latest_publish_date`.** It is a republish stamp and it fails bimodally: on most
+cars it lands within seconds of the true date, so a spot-check looks perfect, and then a car that has
+been listed 232 days reports 38. On the car this rewrite was verified against it reads *today* while
+`added_on` reads three days earlier. `added_on` is the real thing, and the proof is that Spinny's own
+"Newest First" sort is literally `o=-added_on`.
 
 Spinny rounds this up; the script rounds down. A car added four hours ago was listed today.
 
-### 5. Saved, owners, and ready-by
+### 4. Price cut
 
-Three smaller pills, of which at most one shows — the card only has 52 measured pixels of room between
-the wishlist heart and the title, which is three pills, so the least informative one gives way.
+`price cut ₹90k` when Spinny has marked the car down, at a ₹5,000 floor.
 
-**`72 saved`** — the shortlist count. Unlike Cars24, Spinny publishes a raw count rather than rounding
-to the nearest ten, so it is printed verbatim. It is also a weaker signal than it looks: across a whole
-city it correlates with days-listed at rho 0.89, so it is largely an age proxy. 532 saves on a car
-listed 303 days means a lot of people looked and passed. That is why it is the pill that gets dropped
-first, and why the tooltip says so.
+`price_breakdown_v2` keeps the previous price alongside the current one, and it moved the car's own
+*base* price rather than the fees, so this is a genuine markdown rather than a coupon. Nothing on the
+site displays it.
 
-**`2nd owner`** — shown only above one owner, so on about 13% of cards. The card is *passed*
+Two things the previous version of this script got wrong here, both fixed:
+
+- **`is_same_listing_price_update` is not the gate it looks like.** It reads `false` on **400 of 420**
+  cars, cut or not, so gating on it does nothing. Cuts occur on cars where it is true as well.
+- **The subtraction needs both operands checked.** `listing_price_without_gst` is absent on the odd
+  car, and treating a missing current price as zero reports the *entire price* as a discount.
+
+It fires on 22 of 420 cars. Read it next to days-listed, because the cut is largely a function of how
+long the car has been sitting. Measured over 199 cards that had both values on screen at once:
+
+| listed | cars | cut | rate |
+|---|---|---|---|
+| under 15 days | 158 | 9 | 5% |
+| 15–30 days | 21 | 4 | 19% |
+| 30–60 days | 12 | 5 | 41% |
+| over 60 days | 8 | 5 | **62%** |
+
+The largest cut found was **₹5.80L off a 2020 Mercedes C-Class that had been listed 336 days**.
+Because the default sort is newest-first, you will see almost no cuts on the first screenful and
+plenty by the last.
+
+**No date is claimed.** `current_price_data.created_on` dates the last repricing, not the cut, and
+its distribution is identical on cars that were cut and cars that never were. So it cannot carry the
+claim and isn't used.
+
+### 5. Owners and ready-by
+
+**`2nd owner`** — shown only above one owner, so on about a quarter of cards. The card is *passed*
 `no_of_owners` and uses it for exactly one thing: printing "Unregistered" instead of the RTO when the
 count is zero. The number itself is never displayed, though it moves resale value more than most of
 what is.
 
-**`ready 18 Aug`** — for cars still in refurbishment. Spinny badges these with a wordless `UPCOMING`
-icon: you are told the car isn't ready, never when. `available_on` is an exact datetime.
+**`ready 23 Aug`** — for the ~17% of cars still in refurbishment. Spinny badges these `UPCOMING` and
+tells you the car isn't ready, never when. `available_on` is an exact datetime.
 
 ---
 
 ## What it deliberately does *not* show
 
-The Cars24 version of this script shows **"% off new"** — how much cheaper a car is than that model
-new. Spinny appears to hand you the same thing for free, in a per-car field called `on_road_price` that
-looks exactly like the on-road price that trim cost when new.
+### "% off new"
 
-It is not, and finding out took 5,086 cars across 21 cities plus archived price lists.
+The Cars24 version of this script shows how much cheaper a car is than that model new. Spinny appears
+to hand you the same thing for free, in a per-car field called `on_road_price`. It is not, and finding
+out took 5,086 cars across 21 cities plus archived price lists.
 
-**What the field actually is:** it is keyed to the *variant name*, and its vintage is whenever that
-name was last priced. If the name is still on sale, the value is **today's** new price — checked
-against two independent outside sources, Hyundai Grand i10 Nios Sportz came out within 0.2%, MG Hector
-Sharp within 0.4%, Venue SX (O) within 0.1%. If the name has been retired, the value is frozen at
-whenever it was retired.
-
-That is fatal, because it means for **half the inventory the field is today's new price** — 28 of 56
-comparable cards sit within ±11% of it, and 22 of those cars are four or more model years old, up to
-fifteen. That is precisely the contaminated quantity the Cars24 README warns about ("most of that
-'discount' is inflation wearing a disguise") — except with no age ceiling and, worse, no per-card
-signal telling you which half you are in. **22 of 65** populated cards would print above the 40%
-ceiling Cars24 enforces; five above 50%.
-
-It also explains why the field looks so convincing at first. For long-dead nameplates the frozen
-snapshot lands near the era of the only cars that ever wore that name, so it is accidentally right.
-It breaks precisely on the nameplates that survived.
+The field is keyed to the **variant name**, and its vintage is whenever that name was last priced. If
+the name is still on sale the value is *today's* new price; if the name was retired the value is
+frozen at retirement. That is fatal, because for half the inventory the field is today's price
+against a car up to fifteen years old, with no per-card signal telling you which half you are in.
+**22 of 65** populated cards would print above the 40% ceiling the Cars24 script enforces.
 
 The corroborating damage, all measured:
 
-- **It is not keyed to the trim.** Of the groups sharing one make, model, variant and year, **31.5%**
-  have the field populated on some cars and `null` on their identical twins. A catalogue lookup cannot
-  do that.
+- **Not keyed to the trim.** Of groups sharing one make, model, variant and year, **31.5%** have the
+  field populated on some cars and `null` on their identical twins.
 - **The denominator depends on capitalisation.** An Alto 800 `"Lxi"` is measured against ₹3,90,000 and
-  an Alto 800 `"LXi"` against ₹3,63,000. Both have 2016 cars. A 2019 Baleno `"Delta 1.2"` gets
-  ₹7,00,000 and a 2019 Baleno `"Delta"` gets ₹7,95,000 — same trim, same year, an 11.7-point swing in
-  the printed percentage decided by which string the listing happens to carry.
-- **It is trim-inverted.** 2021 Tata Tiago: `XT` = ₹7,15,000 but `XZ` = ₹6,41,000. XZ is the *higher*
-  trim.
+  an `"LXi"` against ₹3,63,000.
+- **It is trim-inverted.** 2021 Tata Tiago: `XT` = ₹7,15,000 but `XZ` = ₹6,41,000. XZ is the *higher* trim.
 - **It moves the wrong way with year.** Alto 800 LXi reads ₹3,90,000 for 2013–2016 and ₹3,63,000 for
   2016–2019. New cars do not get cheaper.
-- **It is not fuel- or gearbox-keyed either.** One Ford EcoSport figure covers a diesel manual *and* a
-  petrol automatic.
-- **The error does not even have a stable sign.** A 2025 Fronx reads 8.8% *above* Spinny's own current
-  price, because small-car prices fell after the September 2025 GST cut.
+- **The error has no stable sign.** A 2025 Fronx reads 8.8% *above* Spinny's own current price.
 
-The worst provable case: a 2016 Honda Amaze 1.5 VX i-DTEC would print **"61.4% off new"** against
-₹11,02,900. A March 2016 press report caps the *entire* Amaze range at ₹8.19 lakh ex-showroom, so the
-true when-new on-road cannot exceed ₹9.6 lakh. The field overstates by at least 15%, and exceeds the
-top of that whole model line by 35%.
+Worst provable case: a 2016 Honda Amaze 1.5 VX i-DTEC would print **"61.4% off new"** against
+₹11,02,900, when a March 2016 press report caps the *entire* Amaze range at ₹8.19 lakh ex-showroom.
 
-And Spinny already makes this comparison itself, in a perk line that sorts to the front of the card's
-own footer — *"Priced ~₹10.5 lakhs lower compared to it's original new car on-road price."* On 15 of
-the 25 cars carrying it, our figure would contradict theirs on the same card.
+Gating it honestly — provably frozen figure, canonical variant string, live catalogue match on fuel
+and gearbox, plus an age ceiling — keeps **0 of 626** cards in Pune. There is no version of this pill
+that survives its own suppression rules. No number is better than a wrong number, so that slot
+carries the price cut instead, which is exact.
 
-The last thing tried was to rescue it with a gate — require the figure to be provably frozen rather
-than current, the variant string to be canonical, the trim to match a live catalogue page on fuel and
-gearbox, and Cars24's age ceiling on top. Assembled honestly, that predicate keeps **0 of 626** cards
-in Pune. There is no version of this pill that survives its own suppression rules.
+### The shortlist count
 
-**No number is better than a wrong number.** So that slot carries the price cut instead, which is
-exact.
+Removed at the owner's request, and it was the weakest thing here anyway: across a whole city it
+correlates with days-listed at rho 0.89, so it was largely an age proxy wearing a demand costume. 532
+saves on a car listed 303 days means a lot of people looked and passed.
 
-Two other tempting fields, rejected for the same reason:
+Worth recording that it was **not** the cause of the breakage it was blamed for — `shortlist_count`
+is still populated on 385 of 420 cars and still served fine. The real cause is below.
+
+### Two other tempting fields
 
 - **`market_price`** is `price × 1.10`–`1.13` — a fixed markup, not a valuation. Printing "₹40k below
-  market" would launder marketing as signal, which is the sort of thing this script exists to strip.
+  market" would launder marketing as signal, which is what this script exists to strip.
 - **`base_warranty_cost`** varies from ₹3,193 to ₹32,490 and looks like a risk signal. It correlates
-  with age at **−0.33** — the wrong sign. It prices brand and engine, not this car. It appears only as
-  a fee line, which is what it is.
+  with age at **−0.33** — the wrong sign. It prices brand and engine, not this car.
+
+---
+
+## Why version 2 is a rewrite
+
+Version 1.2.1 stopped working entirely, and not because of anything it did. **Spinny rebuilt the
+listing card.** The page moved off Next.js onto React Router and a `ds-*` design system, and every
+anchor the old script depended on returned zero on the live page:
+
+| selector | v1 relied on it for | now on the page |
+|---|---|---|
+| `carListingCardV2Root` | finding cards | **0** |
+| `productDetailContainer` | where to draw | **0** |
+| `priceWithRupeeSymbol` | reading the shown price | **0** |
+| `data-id="shortlist_icon"` | reading the car's id | **0** |
+| `ListingPricingDetail` | the EMI row | **0** |
+| `__reactFiber$` on the card | the fallback data source | **absent** |
+
+Ironically the replacements are *better* anchors: semantic ids and data attributes
+(`#listing-detail-card-v2`, `#shortlist_icon`, `[data-base-component="card"]`) rather than
+CSS-module names.
+
+Two architectural things changed with it.
+
+**It asks for the data instead of eavesdropping on it.** v1 patched `window.XMLHttpRequest` at
+`document-start` to read Spinny's own listing calls, which meant winning a race it could not be
+guaranteed to win, and required `@grant none` to stay in the page realm. v2 calls the API itself:
+`api.spinny.com` honours an undocumented `?ids=` filter and returns
+`access-control-allow-origin: https://www.spinny.com`, so 40 cars cost one ~18 KB request and
+**nothing depends on when the script loaded**. Injected into a page that has already finished
+rendering, it still enriches all 102 cards.
+
+**The adverts are gone, so the code that hid them is too.** v1's headline feature was removing the
+pink discount pill and the "Save extra ₹26.6K" loan banner. On the current site there are **0**
+discount pills, **0** loan banners and **0** struck-through prices — Spinny removed all of it in the
+redesign. Hiding things that no longer exist is dead code, so it went.
 
 ---
 
@@ -282,83 +257,55 @@ Two other tempting fields, rejected for the same reason:
 1. Install [Tampermonkey](https://www.tampermonkey.net/) (Chrome, Firefox, Edge or Safari).
 2. Open [`spinny-card-enricher.user.js`](spinny-card-enricher.user.js), click **Raw**, and
    Tampermonkey will offer to install it.
-3. Go to [spinny.com](https://www.spinny.com) and browse. The price line appears as soon as a card
-   does; the days-listed and saved pills fill in as you scroll.
+3. Go to [spinny.com](https://www.spinny.com) and browse.
 
-Nothing to configure.
+Nothing to configure. If you are upgrading from 1.x, the cache schema changed, so old entries are
+swept on first run.
 
 ---
 
 ## Things worth knowing
 
-**It only reads.** No clicking, no forms, no account. Everything comes from public endpoints and the
-same breakdown the site's own price popup uses. It never sends your data anywhere.
+**It only reads.** No clicking, no forms, no account — `credentials` are omitted from every request
+on purpose. Everything comes from public endpoints and the same breakdown the site's own price popup
+uses. It never sends your data anywhere.
 
-**Most of it is free.** Spinny renders no cards server-side — every one arrives by XHR. The script
-listens to that call and gets the full car object for every card at no network cost of its own. That is
-why it runs at `document-start`: the first listing request lands about 700 ms later, and the app bundles
-are `async` scripts at the tail of a 1.8 MB document, so the tap is in place long before anything can
-call through it.
+**It is polite.** Four requests in flight at most with a gap between them, and results cached in your
+browser. Only days-listed costs a request per car, and only for cards you actually scroll to.
+Scrolling back over cars you have already seen costs nothing — a warm cache draws 62 cards with zero
+network requests.
 
-There are three data sources, in cost order, because relying on the first one alone turned out to be a
-mistake. The tap is free but only sees requests made *after* it is installed, and a userscript manager
-cannot always guarantee it wins that race. So if the tap has no car for a card, React's own fiber still
-holds the object on the card node one hop down — also free. And if even that fails, the script asks for
-the car by id through the same batched `ids=` endpoint it already uses, which folds the result back into
-the tap so the next sweep enriches the card normally. That last hop is what makes the script independent
-of *when* it loaded: injecting it into a page that has already finished loading still enriches every
-card, at the cost of one extra request per 40 of them.
+**Priority is deliberate.** The days-listed fetch waits for the card's record to arrive first.
+Without that wait, four concurrent 200 KB fetches starve the 18 KB batch that every card's price line
+depends on, and the whole grid prices late.
 
-It listens to `fetch` as well as XHR, because a car's own page pulls its similar-cars payload that way
-(`/v3/api/search/listing/<id>/related/v5`) — but that is belt-and-braces. In testing, that strip never
-actually rendered card components, so the script is verified on listing and search pages only.
+**The cache stores what gets drawn, not what arrived.** A distilled record is 523 bytes against the
+15.5 KB it came from, which is what lets a month of browsing fit in localStorage. If the quota fills,
+car records are evicted before listing dates, because a listing date costs 200 KB to rebuild and a
+car record costs one fortieth of an 18 KB call.
 
-**The favourites and recent-view pages are not supported, deliberately.** They do not reuse the listing
-card: their cards are built entirely from `ds-*` utility classes with no CSS-module names at all — no
-`carListingCardV2Root` to find them by, no `productDetailContainer` to attach the line to, and no
-shortlist-icon to read the car's id from. Every anchor the script relies on is absent, so supporting
-them would mean a second, structural way of recognising a card, and a second way of laying the line out.
-That is real work for a page where you are re-reading cars you have already compared, so it is left
-alone. Note the Similar Cars strip on those pages *does* use the listing card and does get enriched —
-which is why the page looks half-done rather than untouched.
+**Nothing is overwritten.** Spinny's card is not height-locked, so the block is *appended* rather
+than written over the top of something. Every card grows by one or two lines and the grid stays even.
 
-**It is polite.** Four requests in flight at most, with a gap between them, and results cached in your
-browser. The shortlist count and ready-by date come from one batched request per 40 cards — the
-endpoint the site itself calls drops those fields, but an older version of it answers the same query
-with them, and honours an undocumented `ids=` filter. Only days-listed costs a request per car, and
-only for cards you actually scroll to. Scrolling back over cars you have already seen costs nothing.
+**One strip is not clickable.** Spinny catches card clicks with a transparent overlay covering the
+whole card at `z-index: 2`, which also swallows every hover. The block is lifted above it so its
+tooltips work; the cost is that this one strip does not open the car. That seemed like the right trade
+for being able to read the breakdown.
 
-**Nothing waits that doesn't have to.** The all-in price, the fee split and the km/year pill come
-entirely out of the intercepted payload, so they are drawn the moment a card exists rather than when
-you happen to look at it. Only the two enrichments that cost a request — days-listed and the shortlist
-count — wait for a card to come within 200px of the viewport.
+**Discovery is a sweep, not an `IntersectionObserver`.** Spinny mounts the grid lazily — on a filtered
+page cards can appear twenty seconds in and at zero height — and an observer's first callback then
+reports every one of them as not intersecting, after which nothing calls it again and the page stays
+bare. A plain sweep over the cards that exist right now, re-run on scroll, resize, navigation, DOM
+mutation, tab focus and a 1.5s backstop timer, cannot get wedged that way. A sweep is a `WeakSet`
+lookup per card, so running it unconditionally costs nothing.
 
-This split matters more than it sounds. The first version gated *everything* behind an
-`IntersectionObserver`, and on a filtered result page that failed completely: Spinny mounts the grid
-lazily, so on a URL with filters the cards can appear twenty seconds in and at zero height. The
-observer's first callback then reports every one of them as not intersecting, nothing ever calls it
-again, and the whole page stays blank while the "similar cars" strip below it — mounted later, while
-you are already scrolling — enriches perfectly. Discovery is now a plain sweep over the cards that
-exist right now, re-run on scroll, resize, navigation, DOM mutations, tab focus, and on a two-second
-backstop timer. A sweep is a `WeakSet` check per card, so running it unconditionally costs nothing,
-and unlike the observer it cannot get permanently wedged by a card that mounted at the wrong moment.
+**It redraws itself.** React replaces card subtrees as you scroll and paginate, so a block that was
+drawn can vanish. Each sweep notices and redraws from the record already in hand, with no request.
+Heavy scrolling over 142 cards produced 142 blocks, no duplicates and no gaps.
 
-**`@grant none` is deliberate.** It puts the script in the page's own realm, which is the only way
-patching `window.XMLHttpRequest` patches the object Spinny's bundles actually call. Any `@grant` at all
-would sandbox it and the tap would go deaf.
-
-**Nothing is overwritten.** Unlike the Cars24 card, Spinny's is not height-locked — nothing from the
-grid cell down to the detail container sets a height or clips — so the fee line is *appended* rather
-than written over the top of something of Spinny's. Every card grows by exactly one line, so the grid
-stays even.
-
-**One line is not clickable.** Spinny catches card clicks with a transparent overlay covering the whole
-card, which also swallows every hover. The fee line is lifted above that overlay so its tooltip works;
-the cost is that this one strip does not open the car. That seemed like the right trade for being able
-to read the breakdown.
-
-**If it can't reach the network, it gets out of the way.** No error toasts, no broken layout. The two
-adverts still go — that part is pure CSS and needs nothing.
+**If it can't reach the network, it gets out of the way.** No error toasts, no broken layout. In
+private mode Spinny's own app renders zero cards before this script gets a look in, and the script
+survives a `localStorage` that throws on every access.
 
 ---
 
@@ -366,48 +313,40 @@ adverts still go — that part is pure CSS and needs nothing.
 
 Spinny is a live site and it will change.
 
-The good news is that its class names are **not** content hashes. They are CSS-module names derived
-from filenames — `CarListingCardV2__carListingCarContainer`, `LoanDiscountSavings__pill` — so they
-survive deploys, and they are byte-identical between the desktop and mobile builds. Selectors are
-matched on substrings where a component has both a V2 and a V3 spelling, so a version bump is handled.
-
 **If something looks wrong, ask the script.** Open the console on a listing page and run:
 
 ```js
 spinnyEnricher.status()
 ```
 
-`ReferenceError: spinnyEnricher is not defined` means the script is not running at all — check that it
-is enabled in Tampermonkey and that the page was hard-reloaded. Otherwise it reports how many cards are
-on the page, how many got a price line, how many cars the tap captured, and whether the first card has
-data yet, which separates "not running" from "running but finding nothing". `spinnyEnricher.rescan()`
-forces a sweep.
+`ReferenceError: spinnyEnricher is not defined` means the script is not running at all — check it is
+enabled in Tampermonkey and hard-reload. Otherwise it reports how many cards are on the page, how
+many got drawn, how many have a record, whether the first card resolves to an id and a place to draw,
+and how many entries are cached. That separates "not running" from "running but finding nothing".
+`spinnyEnricher.rescan()` forces a sweep and `spinnyEnricher.clearCache()` empties the cache.
 
 Likely failure modes:
 
-- **The fee line disappears everywhere.** The breakdown changed shape and no candidate matches the
-  price on the card, so the script is refusing to guess. This is working as intended; turn on
-  `debug: true` and the console will name each card it declined and why.
-- **The adverts come back.** A class was renamed. Both are hidden by substring
-  (`specialOfferBadgeWrapper`, `savingsWithLoanCampaign`), so it would take a real rename, not a
-  reshuffle.
-- **The EMI row is pink and empty.** The banner is being hidden but the row's promo skin is not. Spinny
-  paints that as an *inline* gradient, so the override depends on an `!important` rule outranking it.
+- **Nothing appears anywhere, `cardsOnPage: 0`.** Card discovery, not the price logic. The script
+  finds cards by `#shortlist_icon` and `[id^="listing-detail-card"]`; if both were renamed it finds
+  nothing. Check what the card's outermost `data-base-component` / `data-id-componentname` is now.
+- **`cardsOnPage` is right but `cardsWithRecord` is 0.** The API changed. Check
+  `api.spinny.com/v3/api/listing/v3/?ids=<id>&size=1` in a tab; `listApiFallback` already points at
+  v7 for when v3 retires.
+- **Cards found and recorded but nothing drawn.** `hostOf()` found no place to put the block, or
+  `priceOf()` declined. Turn on `debug: true` and it will name each card it skipped.
+- **The price line appears but the fee split looks wrong.** The breakdown changed shape. The two
+  identities in §1 are the test — if `base + inside` no longer equals `listing_price_without_tax`,
+  the card is printing a different figure and `shown` needs re-deriving.
 - **Days-listed stops appearing.** The page-data route moved or dropped `added_on`. Nothing else
-  depends on it. Do not "fix" this by substituting `latest_publish_date` — see above for why.
-- **The pills overlap the car's name.** The card geometry changed. The stack is sized against a
-  measured 52px band between the heart and the title; `maxPills` is the knob.
-- **One section of a page is enriched and another isn't.** Almost always the card-discovery sweep, not
-  the price logic — the enriched section proves the payload, the selectors and the rendering all work.
-  Turn on `debug: true`: silence for the blank section means the sweep never reached those cards, while
-  a "price not decomposable" line per card means it reached them and declined. If it is the sweep,
-  `sweepMs` is the backstop interval.
+  depends on it. Do not "fix" it with `latest_publish_date` — see §3.
+- **The block is there but the tooltip won't show.** The click overlay's `z-index` went above 3.
 
-One quirk worth recording, because it looks like a bug and isn't: Spinny's own check for whether a sale
-is still running splits `end_time` on a `"T"` that its own space-separated timestamps do not contain,
-so the expiry test never fires and a sale is "live" whenever its value is above zero. The script does
-not copy the bug, but it does not enforce the intent either — if the discount is in the price the card
-is showing, that price is the one that needs explaining.
+One quirk worth recording, because it looks like a bug and isn't: Spinny's own check for whether a
+sale is still running splits `end_time` on a `"T"` that its own space-separated timestamps do not
+contain, so the expiry test never fires. The script does not copy the bug, but it does not enforce the
+intent either — if a discount is in the price the card is showing, that price is the one that needs
+explaining.
 
 ---
 
@@ -415,18 +354,18 @@ is showing, that price is the one that needs explaining.
 
 Everything factual here was checked against live data, not assumed:
 
-- The price model was verified on **5,086 cars across 21 cities**. The headline the script computes
-  matches the formula Spinny's own bundle uses on **5,086 of 5,086**, and the all-in total reconciles
-  against an independent field on all of them.
-- It reconciles *better* than Spinny's own aggregate in two places. On **45 cars**, a sale discount
-  drops the base under ₹10 lakh, so the car's `adjusted_tcs` goes to zero while `listing_price` still
-  carries the full 1% TCS — the script charges only what the itemised lines charge, about ₹10,000 less.
-  On one car, `final_discounted_price` deducts a whole TCS instead of the part the discount removed.
-- Fee line names are **not** fixed nationally: alongside TCS there is a `transfer_tax` in Gujarat,
-  found only by sampling beyond one city. They are summed rather than named for that reason.
-- The script was run against the live site in a real browser. On a Pune listing page it enriched every
-  card it processed, hid **37 of 37** discount pills and **42 of 42** loan banners, and left every EMI
-  figure intact.
+- The price model was verified on **420 cars across 7 cities**. Both identities hold on 420 of 420,
+  and every car has fees inside the headline *and* money owed on top of it.
+- The script was run against the live site in a real browser at every stage. On a Pune listing page it
+  drew on **162 of 162** cards with none missing, none malformed and none overflowing; **82 of 82** on
+  a brand-filtered page; **82 of 82** on a budget-filtered Bangalore page; **20 of 20** on the home
+  page; **3 of 3** in the similar-cars strip on a car's own page.
+- Injected *after* the page had fully loaded, it still drew **102 of 102** — the case v1's network tap
+  could not recover from.
+- With plain `fetch` blocked to force the `GM_xmlhttpRequest` fallback, 60 blocked attempts became 58
+  GM requests and **62 of 62** cards were still drawn.
+- 51 unit assertions cover the formatting, the IST timestamp handling, the price decomposition, the
+  price-cut guards and every chip, including the `"included"` fee line whose value is a string.
 
 ---
 
