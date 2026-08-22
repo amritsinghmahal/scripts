@@ -1,39 +1,46 @@
 // ==UserScript==
 // @name         Spinny Card Enricher
 // @namespace    https://github.com/amritsinghmahal/scripts
-// @version      2.0.0
-// @description  Splits out the fees baked into every Spinny price, shows what is still owed on top of the figure printed on the card, and adds km/year, days listed, owners, any price cut and the ready-by date.
+// @version      3.0.0
+// @description  Splits out the fees baked into every Spinny price, shows what is still owed on top of the figure printed on the card, adds km/year, days listed, owners, price cuts and ready-by dates - and strips the sale-discount pill and the "Save extra" loan banner.
 // @match        https://www.spinny.com/*
 // @connect      api.spinny.com
 // @connect      www.spinny.com
 // @grant        GM_xmlhttpRequest
-// @grant        unsafeWindow
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
 
-// The previous version tapped window.XMLHttpRequest at document-start to read Spinny's own
-// listing calls, which meant winning a race it could not be guaranteed to win. It asks the
-// API for the cars itself instead: api.spinny.com answers an undocumented ?ids= filter and
-// returns access-control-allow-origin: https://www.spinny.com, so a plain fetch from the page
-// works and nothing depends on when the script loaded.
+// Spinny serves two different listing cards from the same build, chosen by an A/B flag, and
+// they share not one selector. Version 2 was written against the wrong one: a headless browser
+// gets the ds-* rebuild, a real browser gets the CarListingCardV2 card, so the script found
+// zero cards and did nothing at all. Both are supported here, and there is a structural
+// fallback for whatever comes third - see LAYOUTS.
 
 (function () {
     'use strict';
 
+    const VERSION = '3.0.0';
+
     const CONFIG = {
-        // Everything except days-listed comes from this one batched call - 40 ids at a time,
-        // about 18 KB gzipped. ?ids= is undocumented but honoured.
+        // Everything except days-listed comes from this one batched call - 40 cars at a time,
+        // about 18 KB. ?ids= is undocumented but honoured.
         listApi: 'https://api.spinny.com/v3/api/listing/v3/',
-        // v3 carries available_on and the widest record. v7 is what the site itself calls now
-        // and answers the same query, so it stands in if v3 is ever retired.
+        // v3 carries available_on and the widest record. v7 is what the site itself calls and
+        // answers the same query, so it stands in if v3 is retired.
         listApiFallback: 'https://api.spinny.com/v3/api/listing/v7/',
         // added_on lives here and nowhere else. See daysListedOf().
         detailApi: 'https://www.spinny.com/api/product-detail/fetch-page-data/',
 
-        // The one enrichment that costs a request per car. Set false to make the script pay
-        // nothing beyond one call per 40 cards.
+        // The one enrichment that costs a request per car. false makes the script pay nothing
+        // beyond one call per 40 cards.
         showDaysListed: true,
+
+        // Adverts. The first two are on the CarListingCardV2 card only; the ds-* rebuild
+        // dropped all three, in which case these rules match nothing and cost nothing.
+        hideSalePill: true,
+        hideLoanBanner: true,
+        hideSlashedPrice: false,
 
         ttl: {
             car: 6 * 60 * 60 * 1000,
@@ -49,10 +56,7 @@
         batchSize: 40,
         batchWaitMs: 90,
 
-        // How far outside the viewport a card still counts as worth paying a request for.
         viewportMargin: 250,
-        // Debounce for the sweep, and the longest it may be deferred - a continuous scroll
-        // would otherwise keep resetting the timer and starve it indefinitely.
         scanDebounceMs: 150,
         scanMaxWaitMs: 600,
         // Backstop sweep. Every event-driven trigger is a guess about when Spinny changes the
@@ -64,27 +68,110 @@
         staleDays: 60,
         minPriceCut: 5000,
 
+        // A card is a card, not a page section. The legacy stylesheet caps the listing card at
+        // max-width:560px and the widest measured is 314px, so this only ever excludes whole
+        // sections that happen to be about one car - the hero on a car's own page above all.
+        maxCardWidth: 700,
+
         debug: false,
+        // Prints one line naming what it found if nothing has been drawn by then. This script
+        // has now failed twice in ways that were invisible from the outside; this is cheap.
+        complainAfterMs: 8000,
     };
 
     const LOG = (...a) => { if (CONFIG.debug) console.log('[spce]', ...a); };
 
-    // Spinny rebuilt the listing card on a design system of ds-* utility classes, so the
-    // CSS-module names the old version matched on (carListingCardV2Root, productDetailContainer,
-    // priceWithRupeeSymbol) are all gone. What replaced them is better: ids and data-attributes
-    // with semantic names, one set per card. Matched on a prefix so a -v3 bump still finds them.
-    // Two card components are in play and they mark themselves differently: the grid card on
-    // listing, search and home pages, and CarListingCardV3New in the similar-cars strip on a
-    // car's own page, which lays the photo beside the details instead of above them.
-    const SEL = {
-        card: '[data-base-component="card"],[data-id-componentname]',
-        detail: '[id^="listing-detail-card"]',
-        heart: '[id="shortlist_icon"]',
-        link: 'a[href*="/buy-used-cars/"]',
-        title: 'h2',
-    };
+    // The two cards Spinny ships. Tried in order; a page may contain both (a listing grid in
+    // one layout can carry a similar-cars strip in the other), so all of them are swept.
+    //
+    // legacy - CarListingCardV2/V3. CSS-module names, derived from filenames rather than
+    //          hashed, so they survive deploys. The heart carries the car id in data-label.
+    // ds     - the design-system rebuild. Utility classes with no component names, but
+    //          semantic ids instead: #shortlist_icon, #listing-detail-card-v2.
+    const LAYOUTS = [
+        {
+            name: 'legacy',
+            card: '[class*="carListingCardV2Root"],[class*="carListingCardV3Root"]',
+            host: '[class*="productDetailContainer"]',
+            heart: '[data-id="shortlist_icon"]',
+        },
+        {
+            name: 'ds',
+            card: '[data-base-component="card"],[data-id-componentname]',
+            host: '[id^="listing-detail-card"]',
+            heart: '[id="shortlist_icon"]',
+        },
+    ];
+
+    // The padded text box under the photo, per component. A page can carry more than one kind
+    // of card - a legacy listing grid also has a "You Might Like" carousel built from a third
+    // component again - and the structural discovery below knows no layout at all, so every
+    // box we know of is tried on every card.
+    const HOSTS = [
+        '[class*="productDetailContainer"]',   // legacy listing card
+        '[id^="listing-detail-card"]',         // ds card
+        '[class*="carDetailContainer"]',       // recommended-cars carousel
+    ];
+
+    // Every card in every layout links to its own car, so this is the one anchor that cannot
+    // be broken by a rename. It backs both the id lookup and the fallback discovery below.
+    // The home page is the exception - its cards carry no href at all - which is why the heart
+    // is checked too.
+    const CAR_LINK = 'a[href*="/buy-used-cars/"]';
+    const CAR_ID = /\/(\d{5,})\/?(?:[?#]|$)/;
+    const ANY_HEART = '[data-id="shortlist_icon"],[id="shortlist_icon"]';
+    // data-category on the heart is the car's procurement tier on a listing card - assured,
+    // budget, luxury, recommended-cars - and this on a car's own page.
+    const HERO = 'product-page';
 
     const BLOCK = 'data-spce';
+
+    /* -- the adverts -------------------------------------------------------- */
+
+    // CSS, not node removal: React re-renders these cards, and !important is the only thing
+    // that outranks the inline gradient Spinny paints onto the EMI row.
+    function stripPromos() {
+        if (document.getElementById('spce-css')) return;
+
+        const rules = [];
+
+        if (CONFIG.hideSalePill) {
+            // A pink pill straddling the top edge of the photo, e.g. "₹9,000 / Ends today".
+            // It restates the gap between the struck price and the headline, so it is the
+            // third time one fact appears on one card.
+            rules.push('[class*="specialOfferBadgeWrapper"]{display:none!important}');
+        }
+
+        if (CONFIG.hideLoanBanner) {
+            // "Save extra ₹30.4K on" - finance.best.details.savings, the interest you would
+            // save at Spinny's campaign rate versus their standard one. It is not money off
+            // the car and only exists if you finance through them.
+            //
+            // This needs care: the banner is the first child of the <li> that also holds the
+            // EMI figure, so hiding the <li> loses the EMI. Hide the banner alone, then clear
+            // the pink gradient border, the rounded corner and the promo text colour Spinny
+            // paints onto that row to match it - otherwise you get an empty pink box.
+            rules.push('[class*="savingsWithLoanCampaign"]{display:none!important}');
+            rules.push(
+                'li[class*="ListingPricingDetail__emi"],li[class*="ListingPricingDetail__userEmi"]' +
+                '{background:none!important;border-color:transparent!important;' +
+                'border-radius:0!important;color:#2e054e!important;padding-left:0!important}'
+            );
+        }
+
+        if (CONFIG.hideSlashedPrice) {
+            rules.push('[class*="slashedPrice"]{display:none!important}');
+        }
+
+        if (!rules.length) return;
+
+        const style = document.createElement('style');
+        style.id = 'spce-css';
+        style.textContent = rules.join('\n');
+
+        const mount = document.head || document.documentElement;
+        if (mount) mount.appendChild(style);
+    }
 
     /* -- storage ----------------------------------------------------------- */
 
@@ -92,7 +179,7 @@
     // origin's quota is full.
     const store = {
         // Bump when a cached record changes shape; older entries are then swept, not read.
-        SCHEMA: 'v2',
+        SCHEMA: 'v3',
         PREFIX: 'spce:',
         key(k) { return this.PREFIX + this.SCHEMA + ':' + k; },
 
@@ -129,7 +216,7 @@
                 write();
             } catch (e) {
                 this.evictCheap();
-                try { write(); } catch (_) { /* the cache is an optimisation */ }
+                try { write(); } catch (_) { /* the cache is only an optimisation */ }
             }
         },
 
@@ -250,11 +337,16 @@
         return e;
     }
 
-    // Both hosts send access-control-allow-origin for www.spinny.com, so plain fetch works and
-    // is the fast path. GM_xmlhttpRequest is the fallback for the day that changes.
-    // credentials are omitted deliberately: none of this needs the account.
+    // Both hosts send access-control-allow-origin for www.spinny.com, so plain fetch is the
+    // fast path. GM_xmlhttpRequest is the fallback for the day that changes, and for any
+    // userscript manager that sandboxes fetch away. credentials are omitted deliberately:
+    // none of this needs the account.
     function httpGet(url) {
-        return fetch(url, { credentials: 'omit' })
+        let f = null;
+        try { f = typeof fetch === 'function' ? fetch : null; } catch (e) { f = null; }
+        if (!f) return gmGet(url);
+
+        return f(url, { credentials: 'omit' })
             .then((r) => {
                 if (!r.ok) throw httpError(r.status);
                 return r.json();
@@ -267,8 +359,11 @@
 
     function gmGet(url) {
         return new Promise((resolve, reject) => {
-            if (typeof GM_xmlhttpRequest !== 'function') return reject(new Error('no GM'));
-            GM_xmlhttpRequest({
+            const gm = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest
+                : (typeof GM !== 'undefined' && GM && GM.xmlHttpRequest) ? GM.xmlHttpRequest : null;
+            if (!gm) return reject(new Error('no GM_xmlhttpRequest'));
+
+            gm({
                 method: 'GET',
                 url,
                 onload: (r) => {
@@ -313,15 +408,15 @@
     //
     //   base_listing_price                       the car
     // + base_add_on_data_list                    servicing, warranty, FASTag, fuel
-    // = listing_price_without_tax                <- WHAT THE CARD SHOWS
+    // = listing_price_without_tax                <- WHAT THE CARD SHOWS, both layouts
     // + mandatory_paid_add_ons_data_list         RC transfer, insurance
     // + tax_add_on_data_list                     TCS, and a transfer_tax in Gujarat
-    // = listing_price_without_gst
+    // = listing_price_without_gst                <- what the heart carries in data-price
     // + gst                                      GST on the whole lot
     // = listing_price                            <- WHAT YOU ACTUALLY PAY
     //
     // Both identities hold on 420 of 420 cars sampled across seven cities, so the stated
-    // totals are taken as authoritative and the line items only itemise them for the tooltip.
+    // totals are authoritative and the line items only itemise them for the tooltip.
     function priceOf(car) {
         const v3 = car.price_breakdown_v3;
         const b = v3 || car.price_breakdown_v2;
@@ -354,12 +449,14 @@
         for (const l of b.tax_add_on_data_list || []) add(l, 'on');
         add(b.gst, 'on');
 
+        const usable = shown > 0 && shown < allIn;
+
         return {
             base,
             allIn,
-            shown: shown > 0 && shown < allIn ? shown : 0,
+            shown: usable ? shown : 0,
             fees: allIn - base,
-            onTop: shown > 0 && shown < allIn ? allIn - shown : 0,
+            onTop: usable ? allIn - shown : 0,
             lines,
             sale: saleOf(car),
             cut: cutOf(car),
@@ -367,8 +464,8 @@
     }
 
     // price_breakdown_v2 keeps the previous price alongside the current one, and it moved the
-    // car's own base price rather than the fees, so this is a genuine markdown rather than a
-    // coupon. Nothing on the site displays it.
+    // car's own base price rather than the fees, so this is a genuine markdown, not a coupon.
+    // Nothing on the site displays it.
     //
     // is_same_listing_price_update is not the gate it looks like - it reads false on 400 of the
     // 420 cars sampled, cut or not - so it is ignored. Both operands of each subtraction are
@@ -390,8 +487,8 @@
         return cut >= CONFIG.minPriceCut ? cut : 0;
     }
 
-    // Empty on every car sampled, so this only ever adds a line to the tooltip. It is here
-    // because a live sale is exactly when the price on the card needs explaining.
+    // A live sale is exactly when the price on the card needs explaining, so it goes in the
+    // tooltip. This is the number the pink pill was restating.
     function saleOf(car) {
         for (const d of [car.discount_v3, car.discount]) {
             if (d && typeof d.value === 'number' && d.value > 0) return d.value;
@@ -424,6 +521,7 @@
     const carData = {
         queue: new Map(),
         timer: null,
+        stats: { requests: 0, found: 0, missed: 0, failed: 0 },
 
         get(id) {
             const hit = store.get('car:' + id);
@@ -451,6 +549,7 @@
             }
 
             const query = '?ids=' + batch.join(',') + '&size=' + batch.length;
+            this.stats.requests++;
 
             gate.run(() => httpGet(CONFIG.listApi + query)
                     .catch(() => httpGet(CONFIG.listApiFallback + query)))
@@ -463,6 +562,7 @@
                     for (const id of batch) {
                         const raw = found.get(id);
                         const car = raw ? distil(raw) : null;
+                        car ? this.stats.found++ : this.stats.missed++;
                         // Unknown ids are dropped from the response rather than returned null,
                         // so a miss is remembered briefly to stop it being asked for again.
                         store.set('car:' + id, car ? { car } : { miss: true },
@@ -470,7 +570,11 @@
                         settleAll(waiting.get(id), car);
                     }
                 })
-                .catch(() => { for (const id of batch) settleAll(waiting.get(id), null); })
+                .catch((e) => {
+                    this.stats.failed++;
+                    LOG('batch failed', e && e.message);
+                    for (const id of batch) settleAll(waiting.get(id), null);
+                })
                 .then(() => { if (this.queue.size) this.flush(); });
         },
     };
@@ -505,8 +609,8 @@
     const GREY = '#5b5b66';
 
     const TONE = {
-        // The neutral tone is the card's own badge: #f6f6f6 on #2e054e, fully round.
-        plain: { bg: '#f6f6f6', fg: PURPLE },
+        // The neutral tone is the card's own badge: light grey behind Spinny purple.
+        plain: { bg: '#f4f4f6', fg: PURPLE },
         good: { bg: '#e7f6ee', fg: '#116343' },
         warn: { bg: '#fdece9', fg: '#a33a2b' },
     };
@@ -627,7 +731,7 @@
                 position: 'relative',
                 'z-index': 3,
                 'margin-top': '8px',
-                'font-family': 'SpinnyJost, inherit',
+                'font-family': 'inherit',
                 cursor: 'default',
             });
             host.appendChild(block);
@@ -654,14 +758,13 @@
 
         priceParts(p).forEach((part, i) => {
             // The separator travels with the text it introduces, inside a nowrap wrapper. As a
-            // flex item of its own it gets left dangling at the end of a wrapped line, which is
-            // what the 199px column in the similar-cars strip does to all three parts.
+            // flex item of its own it gets left dangling at the end of a wrapped line.
             const cell = document.createElement('span');
             cell.style.cssText = css({ 'white-space': 'nowrap' });
 
             if (i) {
                 const sep = document.createElement('span');
-                sep.textContent = '· ';
+                sep.textContent = '· ';
                 sep.style.cssText = css({ color: '#b9b9c2' });
                 cell.appendChild(sep);
             }
@@ -717,49 +820,85 @@
 
     /* -- per card ---------------------------------------------------------- */
 
-    // The heart carries the car's id outright, which is the shortest path to it. The link is
-    // the fallback: its last path segment is the same number.
-    function idOf(card) {
-        const heart = card.querySelector(SEL.heart);
+    const idFromHref = (href) => {
+        const m = String(href || '').match(CAR_ID);
+        return m ? m[1] : null;
+    };
+
+    // The heart carries the car's id outright in both layouts, which is the shortest path to
+    // it. The link is the fallback, and its last path segment is the same number.
+    function idOf(card, layout) {
+        const heart = card.querySelector(layout ? layout.heart : ANY_HEART);
         const label = heart && heart.getAttribute('data-label');
         if (label && /^\d{5,}$/.test(label)) return label;
 
-        const link = card.querySelector(SEL.link);
-        const href = link ? link.getAttribute('href') || '' : '';
-        const m = href.match(/\/(\d{5,})\/?(?:[?#]|$)/);
-        return m ? m[1] : null;
+        const link = card.querySelector(CAR_LINK);
+        return link ? idFromHref(link.getAttribute('href')) : null;
     }
 
-    function hostOf(card) {
-        // The grid card names its detail box outright.
-        const named = card.querySelector(SEL.detail);
-        if (named) return named;
+    function hostOf(card, layout) {
+        // The matching layout's own box first, then every other box we know of.
+        if (layout) {
+            const named = card.querySelector(layout.host);
+            if (named) return named;
+        }
+        for (const sel of HOSTS) {
+            const named = card.querySelector(sel);
+            if (named) return named;
+        }
 
-        // The strip card has no such box - its details are a column beside the photo - and if
-        // that id is ever renamed the grid card won't either. The column holding the title is
-        // the answer in both cases. It is only 199px wide in the strip, which is why the price
-        // line and the chips are both allowed to wrap rather than being truncated.
-        const title = card.querySelector(SEL.title);
-        if (!title) return null;
-        return title.closest('div[class*="ds-flex-col"]') || title.closest('div[class*="ds-px"]');
+        // Nothing recognised. The column holding the title is the next best thing, and failing
+        // that the card itself - drawn at the bottom rather than not at all.
+        const title = card.querySelector('h2,h3');
+        if (title) {
+            const col = title.closest('div[class*="ds-flex-col"],div[class*="etailContainer"],div[class*="ds-px"]');
+            if (col && col !== card) return col;
+        }
+        return card;
     }
 
     const known = new WeakMap();   // card -> the distilled record
     const daysOf = new WeakMap();  // card -> days listed
+    const layoutOf = new WeakMap();
+    const idCache = new WeakMap();
+    const hostCache = new WeakMap();
     const asked = new WeakSet();
     const agedAsked = new WeakSet();
     const broken = new WeakSet();
+
+    // A subtree query each, repeated for every card on every sweep, and neither answer changes
+    // for the life of a card node. Memoising them is most of the difference between a 42 ms
+    // sweep and a 4 ms one once a few hundred cards have accumulated on a scrolled page.
+    function idFor(card) {
+        const hit = idCache.get(card);
+        if (hit) return hit;
+
+        const id = idOf(card, layoutOf.get(card));
+        if (id) idCache.set(card, id);
+        return id;
+    }
+
+    // React does replace the detail box under a card that survives, so a cached host is only
+    // trusted while it is still attached and still inside its own card.
+    function hostFor(card) {
+        const hit = hostCache.get(card);
+        if (hit && hit.isConnected && card.contains(hit)) return hit;
+
+        const host = hostOf(card, layoutOf.get(card));
+        if (host) hostCache.set(card, host);
+        return host;
+    }
 
     function draw(card) {
         const car = known.get(card);
         if (!car || car.dead) return;
 
-        const host = hostOf(card);
+        const host = hostFor(card);
         if (host) render(host, car, daysOf.has(card) ? daysOf.get(card) : null);
     }
 
     function sweepCard(card) {
-        const id = idOf(card);
+        const id = idFor(card);
         if (!id) return;
 
         if (!known.has(card)) {
@@ -776,7 +915,7 @@
 
         // React replaces card subtrees on scroll and pagination, so a block that was drawn can
         // vanish. Redrawing it from the record already in hand costs no request.
-        const host = hostOf(card);
+        const host = hostFor(card);
         if (host && !host.querySelector('[' + BLOCK + ']')) draw(card);
 
         // The one enrichment that costs a request of its own, so it waits twice over: for the
@@ -808,39 +947,160 @@
         return r.bottom > -margin && r.top < (window.innerHeight || 0) + margin;
     }
 
-    function cardNodes() {
-        const out = new Set();
+    // Grow outwards from something belonging to one car until the subtree covers a second one,
+    // then step back. That node is the card, whatever it happens to be called. This is what
+    // makes the script survive the next redesign: it needs no class name, no id and no data
+    // attribute, only the fact that a card is about exactly one car.
+    function growCard(seed, count) {
+        let node = seed;
+        let best = null;
+        for (let depth = 0; node && depth < 12 && node !== document.body; depth++) {
+            if (count(node) > 1) break;
+            // Stop before climbing out of card-sized boxes into the page section around them.
+            if (node.getBoundingClientRect().width > CONFIG.maxCardWidth) break;
+            best = node;
+            node = node.parentElement;
+        }
+        // A bare link or icon is not a card. Require room for a price line in it.
+        return best && best !== seed && best.getBoundingClientRect().height >= 80 ? best : null;
+    }
 
-        const take = (node) => {
-            const card = node.closest(SEL.card);
-            // data-id-componentname also marks page-level containers - the listing grid itself
-            // carries one - so anything holding more than one heart is a grid, not a car.
-            if (card && card.querySelectorAll(SEL.heart).length <= 1) out.add(card);
+    const heartsIn = (node) => node.querySelectorAll(ANY_HEART).length;
+
+    const carsIn = (node) => {
+        const ids = new Set();
+        for (const a of node.querySelectorAll(CAR_LINK)) {
+            const id = idFromHref(a.getAttribute('href'));
+            if (id) ids.add(id);
+        }
+        return ids.size;
+    };
+
+    function cardFromLink(link) {
+        return idFromHref(link.getAttribute('href')) ? growCard(link, carsIn) : null;
+    }
+
+    function cardFromHeart(heart) {
+        return growCard(heart, heartsIn);
+    }
+
+    // Every listing card in every component Spinny ships - legacy, ds, and the recommended-cars
+    // carousel - carries exactly one shortlist heart, and it is the only thing that names the car
+    // from inside the card. Requiring it is what keeps the script off page furniture: the home
+    // page puts data-id-componentname on 338 nodes, most of which are not cards at all.
+    function looksLikeCard(node, layout) {
+        if (node.getBoundingClientRect().width > CONFIG.maxCardWidth) return false;
+
+        const hearts = node.querySelectorAll(layout ? layout.heart : ANY_HEART);
+        if (hearts.length !== 1) return false;
+        // The hero on a car's own page carries a heart too, but it is a page section rather than
+        // a card - and that page already itemises the price under the headline, which is the one
+        // place Spinny does disclose it.
+        if (hearts[0].getAttribute('data-category') === HERO) return false;
+
+        // More than one car in scope makes this a strip rather than a card.
+        return carsIn(node) <= 1;
+    }
+
+    // Used only when nothing above matched at all, so there is no heart to key on and the car
+    // link is the only evidence left.
+    function looksLikeCardByLink(node) {
+        if (node.getBoundingClientRect().width > CONFIG.maxCardWidth) return false;
+        if (node.querySelectorAll(ANY_HEART).length > 1) return false;
+        return carsIn(node) === 1;
+    }
+
+    // Vetting a candidate costs a rect read and two subtree walks, and a node that is a card
+    // stays one. Only acceptances are remembered: a rejection is often just a card React has not
+    // finished mounting - zero hearts, zero width - and caching that would blank it permanently.
+    const vetted = new WeakMap();
+
+    function vet(node, layout) {
+        if (vetted.has(node)) return vetted.get(node);
+        if (!looksLikeCard(node, layout)) return undefined;
+        vetted.set(node, layout);
+        return layout;
+    }
+
+    function cardNodes() {
+        const cands = new Map();   // node -> layout, or null when found structurally
+
+        for (const layout of LAYOUTS) {
+            for (const node of document.querySelectorAll(layout.card)) {
+                if (cands.has(node)) continue;
+                const ok = vet(node, layout);
+                if (ok !== undefined) cands.set(node, ok);
+            }
+        }
+
+        const covered = (el) => {
+            for (let n = el; n; n = n.parentElement) if (cands.has(n)) return true;
+            return false;
         };
 
-        for (const heart of document.querySelectorAll(SEL.heart)) take(heart);
-        // The detail box is the thing actually needed, and not every layout is guaranteed to
-        // carry the heart, so it gets a look-in of its own.
-        for (const detail of document.querySelectorAll(SEL.detail)) take(detail);
+        // Any heart outside every card found above belongs to a component nobody has named.
+        // On a listing page that is the "You Might Like" carousel, a third card type sharing no
+        // marker with either layout; growing outwards from the heart catches it without having
+        // to name it, and will catch the fourth type too.
+        for (const heart of document.querySelectorAll(ANY_HEART)) {
+            if (covered(heart)) continue;
+            const card = cardFromHeart(heart);
+            if (card && !cands.has(card) && vet(card, null) !== undefined) cands.set(card, null);
+        }
 
-        return out;
+        // Links are the last resort, for a listing grid whose cards have lost their hearts.
+        // Skipped on a car's own page: every second link there points at the page's own car -
+        // 70 of them on the one measured - so this path would carpet the page instead of
+        // finding cards.
+        if (!cands.size && !idFromHref(location.pathname)) {
+            for (const link of document.querySelectorAll(CAR_LINK)) {
+                const card = cardFromLink(link);
+                if (card && !cands.has(card) && looksLikeCardByLink(card)) cands.set(card, null);
+            }
+        }
+
+        // Both layouts can mark nested nodes around one car - a [data-base-component="card"]
+        // inside a [data-id-componentname] wrapper, say - and each would get its own block.
+        // Keep the innermost: it is the one whose detail box belongs to this car.
+        //
+        // Done by walking each candidate's ancestors and dropping any that is also a candidate,
+        // rather than testing every pair: at 676 cards the pairwise version is 450,000 contains()
+        // calls per sweep.
+        const outer = new Set();
+        for (const node of cands.keys()) {
+            for (let p = node.parentElement; p; p = p.parentElement) {
+                if (cands.has(p)) outer.add(p);
+            }
+        }
+        if (outer.size) for (const node of outer) cands.delete(node);
+
+        return cands;
     }
+
+    let lastSeen = { cards: 0, layouts: '' };
 
     function scan() {
         if (document.hidden) return;
 
-        for (const card of cardNodes()) {
-            // One unfamiliar card - a payload in a shape not seen, a node React is midway
-            // through replacing - must never take the rest of the page with it, and must not be
-            // retried forever either, or every sweep dies at the same card.
+        const found = cardNodes();
+        const names = new Set();
+
+        for (const [card, layout] of found) {
+            if (layout) names.add(layout.name); else names.add('structural');
             if (broken.has(card)) continue;
+            if (!layoutOf.has(card) && layout) layoutOf.set(card, layout);
             try {
                 sweepCard(card);
             } catch (e) {
+                // One unfamiliar card - a payload in a shape not seen, a node React is midway
+                // through replacing - must never take the rest of the page with it, and must
+                // not be retried forever either, or every sweep dies at the same card.
                 broken.add(card);
                 LOG('card threw, skipping it', e);
             }
         }
+
+        lastSeen = { cards: found.size, layouts: Array.from(names).join('+') || 'none' };
     }
 
     let scanTimer = null;
@@ -872,13 +1132,68 @@
         }
     }
 
+    /* -- diagnostics ------------------------------------------------------- */
+
+    function probe() {
+        const count = (s) => { try { return document.querySelectorAll(s).length; } catch (e) { return 'err'; } };
+        const out = { version: VERSION, url: location.href, layouts: {} };
+        for (const l of LAYOUTS) {
+            out.layouts[l.name] = { card: count(l.card), host: count(l.host), heart: count(l.heart) };
+        }
+        out.carLinks = count(CAR_LINK);
+        out.cardsFound = lastSeen.cards;
+        out.layoutInUse = lastSeen.layouts;
+        out.blocksDrawn = count('[' + BLOCK + ']');
+        out.promoCss = !!document.getElementById('spce-css');
+        out.batches = Object.assign({}, carData.stats);
+        out.canFetch = typeof fetch === 'function';
+        out.canGM = typeof GM_xmlhttpRequest === 'function';
+        try { localStorage.getItem('x'); out.storage = true; } catch (e) { out.storage = false; }
+        return out;
+    }
+
+    // "It does nothing at all" has been the reported symptom twice, and both times the cause was
+    // invisible without asking the page. One line, once, only when there is nothing to show.
+    //
+    // It asks three times before saying anything: a cold cache on a slow connection takes past
+    // ten seconds to draw the first card, and a diagnostic that cries wolf on every first load
+    // is worse than none.
+    function complainIfIdle(attempt) {
+        if (document.querySelector('[' + BLOCK + ']')) return;
+        // Having nothing to enrich is not a fault. Plenty of pages under this @match carry no
+        // cars at all - the FAQ, the sell flow, a blank tab - and complaining on those is noise.
+        if (!document.querySelector(ANY_HEART) && !document.querySelector(CAR_LINK)) return;
+
+        if (attempt < 2) {
+            setTimeout(() => complainIfIdle(attempt + 1), CONFIG.complainAfterMs);
+            return;
+        }
+
+        console.log(
+            '[Spinny Card Enricher ' + VERSION + '] nothing drawn. Diagnostics:',
+            probe(),
+            '\nRun spinnyEnricher.probe() for this again, or spinnyEnricher.rescan() to retry.'
+        );
+    }
+
+    /* -- start ------------------------------------------------------------- */
+
     // Order matters: every trigger is registered before the first sweep runs. Sweeping first
     // would mean a throw in that sweep silently costs us the observer, the listeners and the
     // backstop timer - one bad card at load and the script is dead for the session.
     function start() {
         try { store.drop(true); } catch (e) {}
+        try { stripPromos(); } catch (e) {}
 
-        new MutationObserver(onMutation).observe(document.body, { childList: true, subtree: true });
+        // A liveness marker that survives the userscript sandbox, where an assignment to
+        // window is invisible from the page's own console.
+        try { document.documentElement.setAttribute('data-spce-version', VERSION); } catch (e) {}
+
+        try {
+            new MutationObserver(onMutation).observe(document.body || document.documentElement, {
+                childList: true, subtree: true,
+            });
+        } catch (e) { LOG('observer failed', e); }
 
         // Scrolling is what brings a card into range, so it drives the sweep directly rather
         // than being inferred from a mutation.
@@ -888,56 +1203,43 @@
         document.addEventListener('visibilitychange', scanSoon);
 
         // The events above cover everything observed, but they are still a model of how Spinny
-        // behaves, and this page has already broken one such model. A sweep is a WeakSet lookup
-        // per card, so running it unconditionally costs nothing and removes the need for the
-        // model to be complete.
+        // behaves, and this page has already broken two such models. A sweep is a WeakSet
+        // lookup per card, so running it unconditionally costs nothing.
         setInterval(scan, CONFIG.sweepMs);
+        setTimeout(() => complainIfIdle(0), CONFIG.complainAfterMs);
 
         scan();
     }
 
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', start);
+        document.addEventListener('DOMContentLoaded', start, { once: true });
     } else {
         start();
     }
 
     /* -- support hook ------------------------------------------------------ */
 
-    // This script has failed twice for reasons invisible from the outside, and both times the
-    // only way to tell "not running" from "running but finding nothing" was to guess. Run
-    // spinnyEnricher.status() in the console and it says which.
     const api = {
-        version: '2.0.0',
-        status() {
-            const cards = Array.from(cardNodes());
-            return {
-                running: true,
-                cardsOnPage: cards.length,
-                cardsDrawn: document.querySelectorAll('[' + BLOCK + ']').length,
-                cardsWithRecord: cards.filter((c) => known.has(c)).length,
-                firstCardId: cards[0] ? idOf(cards[0]) : null,
-                firstCardHasHost: cards[0] ? !!hostOf(cards[0]) : null,
-                cached: (() => {
-                    try {
-                        return Object.keys(localStorage).filter((k) => k.indexOf(store.PREFIX) === 0).length;
-                    } catch (e) { return null; }
-                })(),
-                pageHidden: document.hidden,
-            };
-        },
+        version: VERSION,
+        probe,
+        status: probe,
         rescan: scan,
         clearCache() { store.drop(false); return 'cache cleared'; },
         CONFIG,
     };
 
-    try { (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).spinnyEnricher = api; }
-    catch (e) { window.spinnyEnricher = api; }
+    // unsafeWindow first: with any @grant the script runs in a sandbox whose window the page's
+    // console cannot see, so an assignment there would leave nothing to type.
+    try {
+        if (typeof unsafeWindow !== 'undefined' && unsafeWindow) unsafeWindow.spinnyEnricher = api;
+    } catch (e) {}
+    try { window.spinnyEnricher = api; } catch (e) {}
 
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
-            fmt, parseIst, daysSince, daysUntil, priceOf, cutOf, saleOf, distil,
-            kmChip, ageChip, cutChip, ownersChip, readyChip, priceTip, priceParts, CONFIG,
+            fmt, parseIst, daysSince, daysUntil, priceOf, cutOf, saleOf, distil, probe,
+            kmChip, ageChip, cutChip, ownersChip, readyChip, priceTip, priceParts,
+            idFromHref, LAYOUTS, CONFIG,
         };
     }
 })();
